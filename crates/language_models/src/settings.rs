@@ -71,6 +71,11 @@ impl settings::Settings for AllLanguageModelSettings {
             lmstudio: LmStudioSettings {
                 api_url: lmstudio.api_url.unwrap(),
                 available_models: lmstudio.available_models.unwrap_or_default(),
+                reasoning: lmstudio.reasoning.map(|r| match r {
+                    settings::LmStudioReasoning::Low => lmstudio::Reasoning::Low,
+                    settings::LmStudioReasoning::Medium => lmstudio::Reasoning::Medium,
+                    settings::LmStudioReasoning::High => lmstudio::Reasoning::High,
+                }),
             },
             mistral: MistralSettings {
                 api_url: mistral.api_url.unwrap(),

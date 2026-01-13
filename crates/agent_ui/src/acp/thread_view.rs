@@ -34,6 +34,9 @@ use gpui::{
 use language::Buffer;
 
 use language_model::LanguageModelRegistry;
+use language_models::AllLanguageModelSettings;
+use lmstudio;
+use settings::{update_settings_file, LmStudioReasoning};
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownStyle};
 use project::{AgentServerStore, ExternalAgentServerName, Project, ProjectEntryId};
 use prompt_store::{PromptId, PromptStore};
@@ -2247,7 +2250,7 @@ impl AcpThreadView {
                 futures::select_biased! {
                     result = logged_in => {
                         if let Err(e) = result {
-                            log::error!("{e}");
+                            // log::error!("{e}");
                             return Err(anyhow!("exited before logging in"));
                         }
                     }
@@ -5139,6 +5142,7 @@ impl AcpThreadView {
                         h_flex()
                             .gap_1()
                             .children(self.render_token_usage(cx))
+                            .child(self.render_reasoning_selector(window, cx))
                             .children(self.profile_selector.clone())
                             // Either config_options_view OR (mode_selector + model_selector)
                             .children(self.config_options_view.clone())
@@ -5178,6 +5182,90 @@ impl AcpThreadView {
         self.as_native_thread(cx)
             .and_then(|thread| thread.read(cx).model())
             .is_some_and(|model| model.provider_id() == language_model::ZED_CLOUD_PROVIDER_ID)
+    }
+
+    fn render_reasoning_selector(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let current_reasoning = AllLanguageModelSettings::get_global(cx)
+            .lmstudio
+            .reasoning;
+        
+        let reasoning_label = current_reasoning
+            .map(|r| {
+                let level = match r {
+                    lmstudio::Reasoning::Low => "low",
+                    lmstudio::Reasoning::Medium => "medium",
+                    lmstudio::Reasoning::High => "high",
+                };
+                format!("reasoning: {}", level)
+            })
+            .unwrap_or_else(|| "reasoning: none".to_string());
+
+        ui::PopoverMenu::new("reasoning-selector-acp")
+            .trigger(
+                ui::Button::new("reasoning-button-acp", reasoning_label)
+                    .style(ui::ButtonStyle::Outlined)
+            )
+            .menu(move |window, cx| {
+                Some(ui::ContextMenu::build(window, cx, |menu, _window, _cx| {
+                    menu.entry("Low", None, {
+                        move |_window, cx| {
+                            let fs = <dyn Fs>::global(cx);
+                            update_settings_file(
+                                fs,
+                                cx,
+                                |settings, _| {
+                                    settings
+                                        .language_models
+                                        .get_or_insert_with(Default::default)
+                                        .lmstudio
+                                        .get_or_insert_with(Default::default)
+                                        .reasoning = Some(LmStudioReasoning::Low);
+                                },
+                            );
+                        }
+                    })
+                    .entry("Medium", None, {
+                        move |_window, cx| {
+                            let fs = <dyn Fs>::global(cx);
+                            update_settings_file(
+                                fs,
+                                cx,
+                                |settings, _| {
+                                    settings
+                                        .language_models
+                                        .get_or_insert_with(Default::default)
+                                        .lmstudio
+                                        .get_or_insert_with(Default::default)
+                                        .reasoning = Some(LmStudioReasoning::Medium);
+                                },
+                            );
+                        }
+                    })
+                    .entry("High", None, {
+                        move |_window, cx| {
+                            let fs = <dyn Fs>::global(cx);
+                            update_settings_file(
+                                fs,
+                                cx,
+                                |settings, _| {
+                                    settings
+                                        .language_models
+                                        .get_or_insert_with(Default::default)
+                                        .lmstudio
+                                        .get_or_insert_with(Default::default)
+                                        .reasoning = Some(LmStudioReasoning::High);
+                                },
+                            );
+                        }
+                    })
+                }))
+            })
+            .anchor(gpui::Corner::BottomRight)
+            .into_any_element()
     }
 
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<Div> {

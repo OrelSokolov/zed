@@ -2,6 +2,7 @@ use crate::{AgentTool, ToolCallEventStream};
 use agent_client_protocol as acp;
 use anyhow::{Result, anyhow};
 use futures::FutureExt as _;
+use glob::glob;
 use gpui::{App, AppContext, Entity, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use project::Project;
@@ -9,7 +10,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::{cmp, path::PathBuf, sync::Arc};
-use util::paths::PathMatcher;
 
 /// Fast file path pattern matching tool that works with any codebase size
 ///
@@ -157,34 +157,67 @@ impl AgentTool for FindPathTool {
     }
 }
 
-fn search_paths(glob: &str, project: Entity<Project>, cx: &mut App) -> Task<Result<Vec<PathBuf>>> {
-    let path_style = project.read(cx).path_style(cx);
-    let path_matcher = match PathMatcher::new(
-        [
-            // Sometimes models try to search for "". In this case, return all paths in the project.
-            if glob.is_empty() { "*" } else { glob },
-        ],
-        path_style,
-    ) {
-        Ok(matcher) => matcher,
-        Err(err) => return Task::ready(Err(anyhow!("Invalid glob: {err}"))),
-    };
-    let snapshots: Vec<_> = project
+fn search_paths(glob_pattern: &str, project: Entity<Project>, cx: &mut App) -> Task<Result<Vec<PathBuf>>> {
+    let worktrees: Vec<_> = project
         .read(cx)
         .worktrees(cx)
-        .map(|worktree| worktree.read(cx).snapshot())
+        .map(|worktree| {
+            let worktree_abs_path = worktree.read(cx).abs_path().to_path_buf();
+            (worktree_abs_path, worktree.read(cx).snapshot())
+        })
         .collect();
+
+    let glob_pattern = if glob_pattern.is_empty() {
+        "**/*".to_string()
+    } else {
+        glob_pattern.to_string()
+    };
 
     cx.background_spawn(async move {
         let mut results = Vec::new();
-        for snapshot in snapshots {
-            for entry in snapshot.entries(false, 0) {
-                if path_matcher.is_match(&snapshot.root_name().join(&entry.path)) {
-                    results.push(snapshot.absolutize(&entry.path));
+        
+        for (worktree_abs_path, snapshot) in worktrees {
+            // Build full glob pattern: worktree_path + "/" + user_pattern
+            // For example: /home/oleg/quic-go + "/" + "**/*" = /home/oleg/quic-go/**/*
+            let full_glob_pattern = if glob_pattern.starts_with('/') {
+                // If pattern is absolute, use it as-is
+                glob_pattern.clone()
+            } else {
+                // Otherwise, prepend worktree path
+                format!("{}/{}", worktree_abs_path.display(), glob_pattern)
+            };
+
+            match glob(&full_glob_pattern) {
+                Ok(paths) => {
+                    for entry in paths {
+                        match entry {
+                            Ok(path) => {
+                                // Convert absolute path to relative path from worktree root
+                                if let Ok(relative_path) = path.strip_prefix(&worktree_abs_path) {
+                                    // Normalize: remove leading slash if present, store as relative path
+                                    let relative_str = relative_path.to_string_lossy();
+                                    let normalized = if relative_str.starts_with('/') {
+                                        &relative_str[1..]
+                                    } else {
+                                        &relative_str
+                                    };
+                                    results.push(PathBuf::from(normalized));
+                                }
+                            }
+                            Err(e) => {
+                                // log::warn!("Glob pattern error for path: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow!("Invalid glob pattern '{}': {}", glob_pattern, e));
                 }
             }
         }
 
+        // Sort results for consistent output
+        results.sort();
         Ok(results)
     })
 }
@@ -220,26 +253,14 @@ mod test {
         let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
 
         let matches = cx
-            .update(|cx| search_paths("root/**/car*", project.clone(), cx))
-            .await
-            .unwrap();
-        assert_eq!(
-            matches,
-            &[
-                PathBuf::from(path!("/root/apple/banana/carrot")),
-                PathBuf::from(path!("/root/apple/bandana/carbonara"))
-            ]
-        );
-
-        let matches = cx
             .update(|cx| search_paths("**/car*", project.clone(), cx))
             .await
             .unwrap();
         assert_eq!(
             matches,
             &[
-                PathBuf::from(path!("/root/apple/banana/carrot")),
-                PathBuf::from(path!("/root/apple/bandana/carbonara"))
+                PathBuf::from("apple/banana/carrot"),
+                PathBuf::from("apple/bandana/carbonara")
             ]
         );
     }

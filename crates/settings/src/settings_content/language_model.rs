@@ -144,6 +144,15 @@ impl Default for KeepAlive {
 pub struct LmStudioSettingsContent {
     pub api_url: Option<String>,
     pub available_models: Option<Vec<LmStudioAvailableModel>>,
+    pub reasoning: Option<LmStudioReasoning>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom)]
+#[serde(rename_all = "lowercase")]
+pub enum LmStudioReasoning {
+    Low,
+    Medium,
+    High,
 }
 
 #[with_fallible_options]

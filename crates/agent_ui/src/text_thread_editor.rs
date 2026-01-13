@@ -36,6 +36,8 @@ use language_model::{
     ConfigurationError, IconOrSvg, LanguageModelExt, LanguageModelImage, LanguageModelRegistry,
     Role,
 };
+use language_models::AllLanguageModelSettings;
+use lmstudio;
 use multi_buffer::MultiBufferRow;
 use picker::{Picker, popover_menu::PickerPopoverMenu};
 use project::{Project, Worktree};
@@ -57,8 +59,8 @@ use std::{
 };
 use text::SelectionGoal;
 use ui::{
-    ButtonLike, CommonAnimationExt, Disclosure, ElevationIndex, KeyBinding, PopoverMenuHandle,
-    TintColor, Tooltip, prelude::*,
+    ButtonLike, CommonAnimationExt, Disclosure, ElevationIndex, KeyBinding, PopoverMenu,
+    PopoverMenuHandle, TintColor, Tooltip, prelude::*,
 };
 use util::{ResultExt, maybe};
 use workspace::{
@@ -2291,6 +2293,90 @@ impl TextThreadEditor {
         .render(window, cx)
     }
 
+    fn render_reasoning_selector(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let current_reasoning = AllLanguageModelSettings::get_global(cx)
+            .lmstudio
+            .reasoning;
+        
+        let reasoning_label = current_reasoning
+            .map(|r| {
+                let level = match r {
+                    lmstudio::Reasoning::Low => "low",
+                    lmstudio::Reasoning::Medium => "medium",
+                    lmstudio::Reasoning::High => "high",
+                };
+                format!("reasoning: {}", level)
+            })
+            .unwrap_or_else(|| "reasoning: none".to_string());
+
+        PopoverMenu::new("reasoning-selector-agent")
+            .trigger(
+                Button::new("reasoning-button-agent", reasoning_label)
+                    .style(ButtonStyle::Outlined)
+            )
+            .menu(move |window, cx| {
+                Some(ui::ContextMenu::build(window, cx, |menu, _window, _cx| {
+                    menu.entry("Low", None, {
+                        move |_window, cx| {
+                            let fs = <dyn Fs>::global(cx);
+                            update_settings_file(
+                                fs,
+                                cx,
+                                |settings, _| {
+                                    settings
+                                        .language_models
+                                        .get_or_insert_with(Default::default)
+                                        .lmstudio
+                                        .get_or_insert_with(Default::default)
+                                        .reasoning = Some(settings::LmStudioReasoning::Low);
+                                },
+                            );
+                        }
+                    })
+                    .entry("Medium", None, {
+                        move |_window, cx| {
+                            let fs = <dyn Fs>::global(cx);
+                            update_settings_file(
+                                fs,
+                                cx,
+                                |settings, _| {
+                                    settings
+                                        .language_models
+                                        .get_or_insert_with(Default::default)
+                                        .lmstudio
+                                        .get_or_insert_with(Default::default)
+                                        .reasoning = Some(settings::LmStudioReasoning::Medium);
+                                },
+                            );
+                        }
+                    })
+                    .entry("High", None, {
+                        move |_window, cx| {
+                            let fs = <dyn Fs>::global(cx);
+                            update_settings_file(
+                                fs,
+                                cx,
+                                |settings, _| {
+                                    settings
+                                        .language_models
+                                        .get_or_insert_with(Default::default)
+                                        .lmstudio
+                                        .get_or_insert_with(Default::default)
+                                        .reasoning = Some(settings::LmStudioReasoning::High);
+                                },
+                            );
+                        }
+                    })
+                }))
+            })
+            .anchor(gpui::Corner::BottomRight)
+            .into_any_element()
+    }
+
     fn render_last_error(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let last_error = self.last_error.as_ref()?;
 
@@ -2681,6 +2767,7 @@ impl Render for TextThreadEditor {
                             .child(
                                 h_flex()
                                     .gap_1()
+                                    .child(self.render_reasoning_selector(window, cx))
                                     .child(self.render_language_model_selector(window, cx))
                                     .child(self.render_send_button(window, cx)),
                             ),

@@ -35,6 +35,7 @@ feature_flags.workspace = true
 fs.workspace = true
 futures.workspace = true
 git.workspace = true
+glob.workspace = true
 gpui.workspace = true
 handlebars = { workspace = true, features = ["rust-embed"] }
 html_to_markdown.workspace = true

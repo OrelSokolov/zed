@@ -95,6 +95,14 @@ pub enum ToolChoice {
     Other(ToolDefinition),
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Reasoning {
+    Low,
+    Medium,
+    High,
+}
+
 #[derive(Clone, Deserialize, Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolDefinition {
@@ -220,6 +228,8 @@ pub struct ChatCompletionRequest {
     pub tools: Vec<ToolDefinition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Reasoning>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -347,6 +357,9 @@ pub struct ResponseMessageDelta {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    // LM Studio использует поле "reasoning" вместо "reasoning_content"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallChunk>>,
 }
@@ -394,7 +407,9 @@ pub async fn stream_chat_completion(
         .uri(uri)
         .header("Content-Type", "application/json");
 
-    let request = request_builder.body(AsyncBody::from(serde_json::to_string(&request)?))?;
+    let request_json = serde_json::to_string(&request)?;
+    // log::info!("LM Studio sending request JSON: {}", request_json);
+    let request = request_builder.body(AsyncBody::from(request_json))?;
     let mut response = client.send(request).await?;
     if response.status().is_success() {
         let reader = BufReader::new(response.into_body());
@@ -405,14 +420,34 @@ pub async fn stream_chat_completion(
                     Ok(line) => {
                         let line = line.strip_prefix("data: ")?;
                         if line == "[DONE]" {
+                            // log::info!("LM Studio: received [DONE]");
                             None
                         } else {
+                            // log::info!("LM Studio raw response line: {}", line);
                             match serde_json::from_str(line) {
-                                Ok(ResponseStreamResult::Ok(response)) => Some(Ok(response)),
+                                Ok(ResponseStreamResult::Ok(response)) => {
+                                    // Логируем сырой ответ для отладки
+                                    if let Some(choice) = response.choices.first() {
+                                        // log::info!(
+                                        //     "LM Studio parsed response - content: {:?}, reasoning_content: {:?}, reasoning: {:?}, role: {:?}",
+                                        //     choice.delta.content.as_ref().map(|s| s.as_str()),
+                                        //     choice.delta.reasoning_content.as_ref().map(|s| s.as_str()),
+                                        //     choice.delta.reasoning.as_ref().map(|s| s.as_str()),
+                                        //     choice.delta.role
+                                        // );
+                                    } else {
+                                        // log::info!("LM Studio: response has no choices");
+                                    }
+                                    Some(Ok(response))
+                                }
                                 Ok(ResponseStreamResult::Err { error, .. }) => {
+                                    // log::warn!("LM Studio API error: {}", error.message);
                                     Some(Err(anyhow!(error.message)))
                                 }
-                                Err(error) => Some(Err(anyhow!(error))),
+                                Err(error) => {
+                                    // log::warn!("LM Studio JSON parse error: {}", error);
+                                    Some(Err(anyhow!(error)))
+                                }
                             }
                         }
                     }
@@ -474,7 +509,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&image_part).unwrap();
-        println!("Serialized image part: {}", json);
+        // println!("Serialized image part: {}", json);
 
         // Verify the structure matches what LM Studio expects
         let expected_structure = r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="}}"#;
@@ -488,7 +523,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&text_part).unwrap();
-        println!("Serialized text part: {}", json);
+        // println!("Serialized text part: {}", json);
 
         let expected_structure = r#"{"type":"text","text":"Hello, world!"}"#;
         assert_eq!(json, expected_structure);

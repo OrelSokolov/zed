@@ -36,6 +36,7 @@ const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new(
 pub struct LmStudioSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
+    pub reasoning: Option<lmstudio::Reasoning>,
 }
 
 pub struct LmStudioLanguageModelProvider {
@@ -264,6 +265,7 @@ impl LmStudioLanguageModel {
     fn to_lmstudio_request(
         &self,
         request: LanguageModelRequest,
+        cx: &App,
     ) -> lmstudio::ChatCompletionRequest {
         let mut messages = Vec::new();
 
@@ -338,6 +340,15 @@ impl LmStudioLanguageModel {
             }
         }
 
+        let settings = &AllLanguageModelSettings::get_global(cx).lmstudio;
+        // Если reasoning установлен, автоматически включаем thinking режим
+        // reasoning должен быть установлен только если thinking_allowed = true
+        let reasoning = if request.thinking_allowed {
+            settings.reasoning
+        } else {
+            None
+        };
+
         lmstudio::ChatCompletionRequest {
             model: self.model.name.clone(),
             messages,
@@ -364,6 +375,7 @@ impl LmStudioLanguageModel {
                 LanguageModelToolChoice::Any => lmstudio::ToolChoice::Required,
                 LanguageModelToolChoice::None => lmstudio::ToolChoice::None,
             }),
+            reasoning,
         }
     }
 
@@ -460,8 +472,8 @@ impl LanguageModel for LmStudioLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
-        let request = self.to_lmstudio_request(request);
-        let completions = self.stream_completion(request, cx);
+        let lmstudio_request = cx.update(|cx| self.to_lmstudio_request(request, cx));
+        let completions = self.stream_completion(lmstudio_request, cx);
         async move {
             let mapper = LmStudioEventMapper::new();
             Ok(mapper.map_stream(completions.await?).boxed())
@@ -479,6 +491,50 @@ impl LmStudioEventMapper {
         Self {
             tool_calls_by_index: HashMap::default(),
         }
+    }
+
+    /// Фильтрует специальные токены модели формата <|token_name|> из текста
+    /// Эти токены используются для метаданных (channel, constrain и т.д.) и не должны попадать в пользовательский текст
+    /// Примеры: <|channel|>commentary, <|constrain|>..., <|start|> и т.д.
+    /// 
+    /// Примечание: если токен разбит на несколько чанков при стриминге, незакрытая часть
+    /// в текущем чанке будет пропущена, а закрытие будет обработано в следующем чанке.
+    fn filter_special_tokens(text: &str) -> String {
+        let mut result = String::with_capacity(text.len());
+        let mut chars = text.char_indices().peekable();
+        
+        while let Some((_, ch)) = chars.next() {
+            if ch == '<' {
+                // Проверяем, начинается ли специальный токен <|...|>
+                if let Some(&(_, '|')) = chars.peek() {
+                    // Пропускаем '<|'
+                    chars.next();
+                    
+                    // Ищем закрывающий '|>'
+                    while let Some((_, next_ch)) = chars.peek() {
+                        if *next_ch == '|' {
+                            chars.next();
+                            if let Some(&(_, '>')) = chars.peek() {
+                                chars.next(); // Пропускаем '>'
+                                break;
+                            }
+                        } else {
+                            chars.next();
+                        }
+                    }
+                    
+                    // Пропускаем весь токен (закрытый или незакрытый, если разбит на чанки)
+                    // чтобы не показывать специальные токены пользователю
+                    continue;
+                }
+                // Если это не специальный токен, добавляем '<'
+                result.push(ch);
+            } else {
+                result.push(ch);
+            }
+        }
+        
+        result
     }
 
     pub fn map_stream(
@@ -506,10 +562,21 @@ impl LmStudioEventMapper {
 
         let mut events = Vec::new();
         if let Some(content) = choice.delta.content {
-            events.push(Ok(LanguageModelCompletionEvent::Text(content)));
+            let filtered_content = Self::filter_special_tokens(&content);
+            // Отправляем событие только если после фильтрации остался непустой текст
+            if !filtered_content.is_empty() {
+                events.push(Ok(LanguageModelCompletionEvent::Text(filtered_content)));
+            } else if !content.is_empty() {
+                // Если весь контент был отфильтрован (только специальные токены), логируем для отладки
+                // log::debug!("LM Studio: filtered out special tokens: {}", content);
+            }
         }
 
-        if let Some(reasoning_content) = choice.delta.reasoning_content {
+        // LM Studio использует поле "reasoning" вместо "reasoning_content"
+        let reasoning_text = choice.delta.reasoning_content
+            .or(choice.delta.reasoning);
+        
+        if let Some(reasoning_content) = reasoning_text {
             events.push(Ok(LanguageModelCompletionEvent::Thinking {
                 text: reasoning_content,
                 signature: None,
@@ -581,7 +648,7 @@ impl LmStudioEventMapper {
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
             }
             Some(stop_reason) => {
-                log::error!("Unexpected LMStudio stop_reason: {stop_reason:?}",);
+                // log::error!("Unexpected LMStudio stop_reason: {stop_reason:?}",);
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
             None => {}
