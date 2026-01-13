@@ -146,6 +146,12 @@ pub enum ModelMode {
         /// The maximum number of tokens to use for reasoning. Must be lower than the model's `max_output_tokens`.
         budget_tokens: Option<u64>,
     },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        /// The reasoning effort level (OpenAI-specific, ignored for Bedrock).
+        #[serde(skip)]
+        _effort: (),
+    },
 }
 
 impl From<ModelMode> for BedrockModelMode {
@@ -153,6 +159,7 @@ impl From<ModelMode> for BedrockModelMode {
         match value {
             ModelMode::Default => BedrockModelMode::Default,
             ModelMode::Thinking { budget_tokens } => BedrockModelMode::Thinking { budget_tokens },
+            ModelMode::Reasoning { .. } => BedrockModelMode::Default,
         }
     }
 }

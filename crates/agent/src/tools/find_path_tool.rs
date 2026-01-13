@@ -151,7 +151,7 @@ impl AgentTool for FindPathTool {
     }
 }
 
-fn search_paths(glob: &str, project: Entity<Project>, cx: &mut App) -> Task<Result<Vec<PathBuf>>> {
+pub(crate) fn search_paths(glob: &str, project: Entity<Project>, cx: &mut App) -> Task<Result<Vec<PathBuf>>> {
     let path_style = project.read(cx).path_style(cx);
     let path_matcher = match PathMatcher::new(
         [

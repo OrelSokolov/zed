@@ -578,6 +578,22 @@ impl BackgroundExecutor {
                     }
                     max_ticks -= 1;
 
+                    // Логируем частоту вызовов tick()
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+                    static LAST_TICK_LOG: AtomicU64 = AtomicU64::new(0);
+                    static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+                    let start = START_TIME.get_or_init(|| Instant::now());
+                    
+                    let tick_count = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    let elapsed = start.elapsed();
+                    
+                    if tick_count % 1000 == 0 || elapsed.as_secs() > LAST_TICK_LOG.load(Ordering::Relaxed) {
+                        let ticks_per_sec = tick_count as f64 / elapsed.as_secs_f64();
+                        log::info!("[DISPATCHER TICK] Called {} times in {:.2}s, {:.2} ticks/sec", tick_count, elapsed.as_secs_f64(), ticks_per_sec);
+                        LAST_TICK_LOG.store(elapsed.as_secs(), Ordering::Relaxed);
+                    }
+                    
                     if !dispatcher.tick(background_only) {
                         if awoken.swap(false, Ordering::SeqCst) {
                             continue;

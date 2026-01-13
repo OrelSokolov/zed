@@ -69,6 +69,12 @@ pub enum ModelMode {
         /// The maximum number of tokens to use for reasoning. Must be lower than the model's `max_output_tokens`.
         budget_tokens: Option<u32>,
     },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        /// The reasoning effort level (OpenAI-specific, ignored for cloud provider).
+        #[serde(skip)]
+        _effort: (),
+    },
 }
 
 impl From<ModelMode> for AnthropicModelMode {
@@ -76,6 +82,7 @@ impl From<ModelMode> for AnthropicModelMode {
         match value {
             ModelMode::Default => AnthropicModelMode::Default,
             ModelMode::Thinking { budget_tokens } => AnthropicModelMode::Thinking { budget_tokens },
+            ModelMode::Reasoning { .. } => AnthropicModelMode::Default,
         }
     }
 }

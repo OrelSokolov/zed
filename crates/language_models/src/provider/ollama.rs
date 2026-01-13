@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use fs::Fs;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
-use futures::{Stream, TryFutureExt, stream};
+use futures::Stream;
 use gpui::{AnyView, App, AsyncApp, Context, CursorStyle, Entity, Task};
 use http_client::HttpClient;
 use language_model::{
@@ -9,7 +9,7 @@ use language_model::{
     LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
     LanguageModelRequest, LanguageModelRequestTool, LanguageModelToolChoice, LanguageModelToolUse,
-    LanguageModelToolUseId, MessageContent, RateLimiter, Role, StopReason, TokenUsage, env_var,
+    LanguageModelToolUseId, MessageContent, Role, StopReason, TokenUsage, env_var,
 };
 use menu;
 use ollama::{
@@ -258,7 +258,6 @@ impl LanguageModelProvider for OllamaLanguageModelProvider {
                     id: LanguageModelId::from(model.name.clone()),
                     model,
                     http_client: self.http_client.clone(),
-                    request_limiter: RateLimiter::new(4),
                     state: self.state.clone(),
                 }) as Arc<dyn LanguageModel>
             })
@@ -296,7 +295,6 @@ pub struct OllamaLanguageModel {
     id: LanguageModelId,
     model: ollama::Model,
     http_client: Arc<dyn HttpClient>,
-    request_limiter: RateLimiter,
     state: Entity<State>,
 }
 
@@ -484,15 +482,33 @@ impl LanguageModel for OllamaLanguageModel {
             (state.api_key_state.key(&api_url), api_url)
         });
 
-        let future = self.request_limiter.stream(async move {
-            let stream =
-                stream_chat_completion(http_client.as_ref(), &api_url, api_key.as_deref(), request)
-                    .await?;
-            let stream = map_to_language_model_completion_events(stream);
-            Ok(stream)
-        });
+        log::info!("[OLLAMA STREAM_COMPLETION] Starting stream request to {}", api_url);
 
-        future.map_ok(|f| f.boxed()).boxed()
+        let future = async move {
+            // Для локальных запросов используем прямой TCP connection (быстрее, без Tokio/Smol задержек)
+            // Для удаленных запросов используем обычный HTTP client
+            let is_local = api_url.starts_with("http://localhost") 
+                || api_url.starts_with("http://127.0.0.1")
+                || (api_url.starts_with("http://") && api_url.contains("localhost"));
+            
+            let stream = if is_local && api_key.is_none() {
+                log::info!("[OLLAMA] Using direct TCP connection for local request");
+                #[cfg(feature = "direct-tcp")]
+                {
+                    stream_chat_completion_direct(&api_url, api_key.as_deref(), request).await?
+                }
+                #[cfg(not(feature = "direct-tcp"))]
+                {
+                    stream_chat_completion(http_client.as_ref(), &api_url, api_key.as_deref(), request).await?
+                }
+            } else {
+                stream_chat_completion(http_client.as_ref(), &api_url, api_key.as_deref(), request).await?
+            };
+            let stream = map_to_language_model_completion_events(stream);
+            Ok(stream.boxed())
+        };
+
+        future.boxed()
     }
 }
 
@@ -502,99 +518,83 @@ fn map_to_language_model_completion_events(
     // Used for creating unique tool use ids
     static TOOL_CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    struct State {
-        stream: Pin<Box<dyn Stream<Item = anyhow::Result<ChatResponseDelta>> + Send>>,
-        used_tools: bool,
-    }
+    // Используем точно такую же архитектуру как в LMStudio
+    log::info!("[OLLAMA MAP] Starting event mapping stream (LMStudio architecture)");
+    
+    stream.flat_map(move |response| {
+        // Точно так же как в LMStudio: match event и возвращаем stream::iter
+        futures::stream::iter(match response {
+            Ok(delta) => {
+                let mut events = Vec::new();
+                let mut used_tools = false;
 
-    // We need to create a ToolUse and Stop event from a single
-    // response from the original stream
-    let stream = stream::unfold(
-        State {
-            stream,
-            used_tools: false,
-        },
-        async move |mut state| {
-            let response = state.stream.next().await?;
-
-            let delta = match response {
-                Ok(delta) => delta,
-                Err(e) => {
-                    let event = Err(LanguageModelCompletionError::from(anyhow!(e)));
-                    return Some((vec![event], state));
+        match delta.message {
+            ChatMessage::User { content, images: _ } => {
+                events.push(Ok(LanguageModelCompletionEvent::Text(content)));
+            }
+            ChatMessage::System { content } => {
+                events.push(Ok(LanguageModelCompletionEvent::Text(content)));
+            }
+            ChatMessage::Tool { content, .. } => {
+                events.push(Ok(LanguageModelCompletionEvent::Text(content)));
+            }
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+                images: _,
+                thinking,
+            } => {
+                if let Some(text) = thinking {
+                    events.push(Ok(LanguageModelCompletionEvent::Thinking {
+                        text,
+                        signature: None,
+                    }));
                 }
-            };
 
-            let mut events = Vec::new();
-
-            match delta.message {
-                ChatMessage::User { content, images: _ } => {
+                if let Some(tool_call) = tool_calls.and_then(|v| v.into_iter().next()) {
+                    let OllamaToolCall { id, function } = tool_call;
+                    let id = id.unwrap_or_else(|| {
+                        format!(
+                            "{}-{}",
+                            &function.name,
+                            TOOL_CALL_COUNTER.fetch_add(1, Ordering::Relaxed)
+                        )
+                    });
+                    let event = LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                        id: LanguageModelToolUseId::from(id),
+                        name: Arc::from(function.name),
+                        raw_input: function.arguments.to_string(),
+                        input: function.arguments,
+                        is_input_complete: true,
+                        thought_signature: None,
+                    });
+                    events.push(Ok(event));
+                    used_tools = true;
+                } else if !content.is_empty() {
                     events.push(Ok(LanguageModelCompletionEvent::Text(content)));
-                }
-                ChatMessage::System { content } => {
-                    events.push(Ok(LanguageModelCompletionEvent::Text(content)));
-                }
-                ChatMessage::Tool { content, .. } => {
-                    events.push(Ok(LanguageModelCompletionEvent::Text(content)));
-                }
-                ChatMessage::Assistant {
-                    content,
-                    tool_calls,
-                    images: _,
-                    thinking,
-                } => {
-                    if let Some(text) = thinking {
-                        events.push(Ok(LanguageModelCompletionEvent::Thinking {
-                            text,
-                            signature: None,
-                        }));
-                    }
-
-                    if let Some(tool_call) = tool_calls.and_then(|v| v.into_iter().next()) {
-                        let OllamaToolCall { id, function } = tool_call;
-                        let id = id.unwrap_or_else(|| {
-                            format!(
-                                "{}-{}",
-                                &function.name,
-                                TOOL_CALL_COUNTER.fetch_add(1, Ordering::Relaxed)
-                            )
-                        });
-                        let event = LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
-                            id: LanguageModelToolUseId::from(id),
-                            name: Arc::from(function.name),
-                            raw_input: function.arguments.to_string(),
-                            input: function.arguments,
-                            is_input_complete: true,
-                            thought_signature: None,
-                        });
-                        events.push(Ok(event));
-                        state.used_tools = true;
-                    } else if !content.is_empty() {
-                        events.push(Ok(LanguageModelCompletionEvent::Text(content)));
-                    }
-                }
-            };
-
-            if delta.done {
-                events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
-                    input_tokens: delta.prompt_eval_count.unwrap_or(0),
-                    output_tokens: delta.eval_count.unwrap_or(0),
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                })));
-                if state.used_tools {
-                    state.used_tools = false;
-                    events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
-                } else {
-                    events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
                 }
             }
+        };
 
-            Some((events, state))
-        },
-    );
+                if delta.done {
+                    events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                        input_tokens: delta.prompt_eval_count.unwrap_or(0),
+                        output_tokens: delta.eval_count.unwrap_or(0),
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    })));
+                    if used_tools {
+                        events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
+                    } else {
+                        events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
+                    }
+                }
 
-    stream.flat_map(futures::stream::iter)
+                events
+            }
+            Err(e) => vec![Err(LanguageModelCompletionError::from(anyhow!(e)))],
+        })
+    })
 }
 
 struct ConfigurationView {

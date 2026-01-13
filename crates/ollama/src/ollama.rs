@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::BoxStream};
+use futures::{AsyncReadExt, StreamExt, stream::BoxStream};
 use http_client::{AsyncBody, HttpClient, HttpRequestExt, Method, Request as HttpRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -276,43 +276,519 @@ impl ModelShow {
     }
 }
 
+// Синхронная функция для создания потока вне async контекста
+fn spawn_ollama_reader_thread(addr: String, host: String, request_json: String) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("ollama-stream-reader".to_string())
+        .spawn(move || {
+                #[cfg(target_os = "linux")]
+                {
+                    // Логируем TID потока для perf trace
+                    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                    eprintln!("[OLLAMA CONSOLE] Thread started (TID={}), connecting to {}", tid, &addr);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    eprintln!("[OLLAMA CONSOLE] Thread started, connecting to {}", &addr);
+                }
+                use std::io::{Read, Write};
+                use std::net::TcpStream as StdTcpStream;
+            
+                // Создаем синхронное TCP соединение с теми же настройками, что в test_ollama.rs
+                eprintln!("[OLLAMA CONSOLE] Attempting to connect to {}", &addr);
+                let mut tcp_stream = match StdTcpStream::connect(&addr) {
+                    Ok(stream) => {
+                        #[cfg(target_os = "linux")]
+                        {
+                            use std::os::unix::io::AsRawFd;
+                            let fd = stream.as_raw_fd();
+                            eprintln!("[OLLAMA CONSOLE] Connected successfully, TCP socket fd={}", fd);
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            eprintln!("[OLLAMA CONSOLE] Connected successfully");
+                        }
+                        stream.set_nodelay(true).unwrap();
+                        
+                        // Устанавливаем размеры TCP буферов для более быстрого чтения
+                        #[cfg(target_os = "linux")]
+                        {
+                            use std::os::unix::io::AsRawFd;
+                            unsafe {
+                                let fd = stream.as_raw_fd();
+                                // Увеличиваем размер приемного буфера до 64KB
+                                let rcvbuf: libc::c_int = 64 * 1024;
+                                let result = libc::setsockopt(
+                                    fd,
+                                    libc::SOL_SOCKET,
+                                    libc::SO_RCVBUF,
+                                    &rcvbuf as *const _ as *const libc::c_void,
+                                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                                );
+                                if result == 0 {
+                                    eprintln!("[OLLAMA CONSOLE] Set SO_RCVBUF to {} bytes", rcvbuf);
+                                } else {
+                                    eprintln!("[OLLAMA CONSOLE] Failed to set SO_RCVBUF: {}", *libc::__errno_location());
+                                }
+                                
+                                // Устанавливаем SO_RCVLOWAT для более быстрого возврата из read()
+                                let lowat: libc::c_int = 1; // Минимум 1 байт для возврата
+                                let result = libc::setsockopt(
+                                    fd,
+                                    libc::SOL_SOCKET,
+                                    libc::SO_RCVLOWAT,
+                                    &lowat as *const _ as *const libc::c_void,
+                                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                                );
+                                if result == 0 {
+                                    eprintln!("[OLLAMA CONSOLE] Set SO_RCVLOWAT to {} bytes", lowat);
+                                } else {
+                                    eprintln!("[OLLAMA CONSOLE] Failed to set SO_RCVLOWAT: {}", *libc::__errno_location());
+                                }
+                            }
+                        }
+                        
+                        // Используем блокирующий режим (как в test_ollama.rs) - быстрее чем non-blocking + poll
+                        eprintln!("[OLLAMA CONSOLE] Using blocking mode (like test_ollama.rs)");
+                        stream
+                    }
+                    Err(e) => {
+                        eprintln!("[OLLAMA CONSOLE] Failed to connect: {}", e);
+                        return;
+                    }
+                };
+                
+                // Отправляем HTTP запрос синхронно
+                eprintln!("[OLLAMA CONSOLE] Sending HTTP request");
+                let http_request = format!(
+                    "POST /api/chat HTTP/1.1\r\n\
+                     Host: {}\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     \r\n\
+                     {}",
+                    &host,
+                    request_json.len(),
+                    request_json
+                );
+                
+                if let Err(e) = tcp_stream.write_all(http_request.as_bytes()) {
+                    eprintln!("[OLLAMA CONSOLE] Failed to send request: {}", e);
+                    return;
+                }
+                eprintln!("[OLLAMA CONSOLE] Request sent, flushing");
+                if let Err(e) = tcp_stream.flush() {
+                    eprintln!("[OLLAMA CONSOLE] Failed to flush: {}", e);
+                    return;
+                }
+                eprintln!("[OLLAMA CONSOLE] Request flushed, reading headers");
+                
+                // Читаем HTTP заголовки синхронно (блокирующий режим, как в test_ollama.rs)
+                let mut response_buffer = String::new();
+                let mut buffer = [0u8; 8192];
+                loop {
+                    match tcp_stream.read(&mut buffer) {
+                        Ok(0) => {
+                            eprintln!("[OLLAMA CONSOLE] Connection closed before headers");
+                            return;
+                        }
+                        Ok(n) => {
+                            response_buffer.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                            if response_buffer.contains("\r\n\r\n") {
+                                let parts: Vec<&str> = response_buffer.splitn(2, "\r\n\r\n").collect();
+                                response_buffer = parts[1].to_string();
+                                eprintln!("[OLLAMA CONSOLE] Headers received, starting to read body");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[OLLAMA CONSOLE] Read error: {}", e);
+                            return;
+                        }
+                    }
+                }
+                
+                // Читаем тело ответа построчно синхронно
+                let mut buffer = response_buffer;
+                let mut count = 0u64;
+                let start = std::time::Instant::now();
+                let mut read_buffer = [0u8; 256];
+                let mut last_read_time = std::time::Instant::now();
+                
+                // Оптимизация потока без root (Linux)
+                #[cfg(target_os = "linux")]
+                {
+                    unsafe {
+                        let thread_id = libc::pthread_self();
+                        
+                        // 1. Попытка установить CPU affinity - привязываем поток к последнему ядру
+                        // Это может помочь избежать конкуренции с другими потоками Zed
+                        let cpu_count = libc::sysconf(libc::_SC_NPROCESSORS_ONLN);
+                        if cpu_count > 0 {
+                            let last_cpu = (cpu_count - 1) as usize;
+                            let mut cpu_set = std::mem::zeroed::<libc::cpu_set_t>();
+                            libc::CPU_ZERO(&mut cpu_set);
+                            libc::CPU_SET(last_cpu, &mut cpu_set);
+                            
+                            let result = libc::pthread_setaffinity_np(
+                                thread_id,
+                                std::mem::size_of::<libc::cpu_set_t>(),
+                                &cpu_set,
+                            );
+                            if result == 0 {
+                                eprintln!("[OLLAMA CONSOLE] CPU affinity set to CPU {}", last_cpu);
+                            } else {
+                                eprintln!("[OLLAMA CONSOLE] Failed to set CPU affinity: {} (errno: {})", result, *libc::__errno_location());
+                            }
+                        }
+                        
+                        // 2. Попытка установить nice value (может не работать без root для отрицательных значений)
+                        // Но попробуем - если не получится, просто продолжим
+                        let nice_result = libc::nice(-5);
+                        if nice_result >= 0 {
+                            eprintln!("[OLLAMA CONSOLE] Nice value set to {}", nice_result);
+                        } else {
+                            // nice() вернул -1, но это может быть ошибка или успех
+                            // Проверяем errno
+                            let errno = *libc::__errno_location();
+                            if errno == libc::EPERM {
+                                eprintln!("[OLLAMA CONSOLE] Cannot set negative nice value without root (expected)");
+                            } else {
+                                eprintln!("[OLLAMA CONSOLE] Nice value adjustment failed: errno {}", errno);
+                            }
+                        }
+                        
+                        // 3. Устанавливаем SCHED_OTHER с приоритетом 0 (по умолчанию, но явно)
+                        let mut sched_param = std::mem::zeroed::<libc::sched_param>();
+                        sched_param.sched_priority = 0;
+                        let result = libc::pthread_setschedparam(thread_id, libc::SCHED_OTHER, &sched_param);
+                        if result == 0 {
+                            eprintln!("[OLLAMA CONSOLE] Thread scheduling policy set to SCHED_OTHER");
+                        } else {
+                            eprintln!("[OLLAMA CONSOLE] Failed to set scheduling policy: {}", result);
+                        }
+                    }
+                }
+                
+                loop {
+                // Ищем полную строку в буфере
+                if let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim().to_string();
+                    buffer = buffer[newline_pos + 1..].to_string();
+                    
+                    // Пропускаем пустые строки
+                    if line.is_empty() {
+                        continue;
+                    }
+                    
+                    // Ollama может использовать chunked encoding - пропускаем размер чанка
+                    if line.chars().all(|c| c.is_ascii_hexdigit()) {
+                        continue;
+                    }
+                    
+                    count += 1;
+                    let parse_start = std::time::Instant::now();
+                    
+                    // Парсим JSON
+                    let result: Result<ChatResponseDelta> = match serde_json::from_str(&line) {
+                        Ok(delta) => Ok(delta),
+                        Err(e) => {
+                            eprintln!("[OLLAMA CONSOLE] Failed to parse line #{}: {} (line: {}...)", count, e, line.chars().take(100).collect::<String>());
+                            continue;
+                        }
+                    };
+                    let parse_time = parse_start.elapsed();
+                    
+                    // Выводим в консоль
+                    if let Ok(delta) = &result {
+                        match &delta.message {
+                            crate::ChatMessage::Assistant { content, .. } => {
+                                print!("{}", content);
+                                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+                    
+                    // Логируем события
+                    if count <= 20 || count % 10 == 0 {
+                        eprintln!(
+                            "[OLLAMA CONSOLE] Chunk #{}: parsed in {}ms (since_start={}ms)",
+                            count,
+                            parse_time.as_millis(),
+                            start.elapsed().as_millis()
+                        );
+                    }
+                    
+                    // НЕ отправляем в UI - только консольный вывод
+                } else {
+                    // Читаем ещё данные из TCP потока синхронно (блокирующий режим, как в test_ollama.rs)
+                    let time_since_last_read = last_read_time.elapsed();
+                    
+                    // Измеряем время до системного вызова
+                    let before_syscall = std::time::Instant::now();
+                    let syscall_start = std::time::Instant::now();
+                    
+                    let read_result = tcp_stream.read(&mut read_buffer);
+                    
+                    let syscall_time = syscall_start.elapsed();
+                    let total_time = before_syscall.elapsed();
+                    let overhead = (total_time.as_nanos() as i64 - syscall_time.as_nanos() as i64).max(0) as u64;
+                    
+                    match read_result {
+                        Ok(0) => {
+                            eprintln!("[OLLAMA CONSOLE] EOF reached after {} chunks", count);
+                            break; // EOF
+                        }
+                        Ok(n) => {
+                            last_read_time = std::time::Instant::now();
+                            
+                            // Логируем детальную информацию о времени чтения
+                            if count < 5 || total_time.as_millis() > 5 || time_since_last_read.as_millis() > 10 {
+                                eprintln!(
+                                    "[OLLAMA CONSOLE] Read {} bytes: total={}ms, syscall={}ms, overhead={}µs (since_start={}ms, waited={}ms since last read)",
+                                    n,
+                                    total_time.as_millis(),
+                                    syscall_time.as_millis(),
+                                    overhead / 1000,
+                                    start.elapsed().as_millis(),
+                                    time_since_last_read.as_millis()
+                                );
+                            }
+                            buffer.push_str(&String::from_utf8_lossy(&read_buffer[..n]));
+                        }
+                        Err(e) => {
+                            eprintln!("[OLLAMA CONSOLE] Read error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            
+                eprintln!("[OLLAMA CONSOLE] Stream finished, total chunks: {}", count);
+        })
+        .expect("Failed to spawn ollama reader thread")
+}
+
 pub async fn stream_chat_completion(
     client: &dyn HttpClient,
     api_url: &str,
     api_key: Option<&str>,
     request: ChatRequest,
 ) -> Result<BoxStream<'static, Result<ChatResponseDelta>>> {
-    let uri = format!("{api_url}/api/chat");
-    let request = HttpRequest::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("Content-Type", "application/json")
-        .when_some(api_key, |builder, api_key| {
-            builder.header("Authorization", format!("Bearer {api_key}"))
-        })
-        .body(AsyncBody::from(serde_json::to_string(&request)?))?;
-
-    let mut response = client.send(request).await?;
-    if response.status().is_success() {
-        let reader = BufReader::new(response.into_body());
-
-        Ok(reader
-            .lines()
-            .map(|line| match line {
-                Ok(line) => serde_json::from_str(&line).context("Unable to parse chat response"),
-                Err(e) => Err(e.into()),
-            })
-            .boxed())
+    // Для локальных запросов используем прямой TCP через smol в отдельном runtime
+    // Это обходит проблему с Tokio runtime и планировщиком
+    let is_local = api_url.starts_with("http://localhost") 
+        || api_url.starts_with("http://127.0.0.1")
+        || (api_url.starts_with("http://") && api_url.contains("localhost"));
+    
+    log::info!("[OLLAMA STREAM] Checking connection: is_local={}, api_key={:?}, api_url={}", is_local, api_key.is_some(), api_url);
+    
+    if is_local && api_key.is_none() {
+        log::info!("[OLLAMA STREAM] Using direct TCP connection in separate smol runtime");
+        eprintln!("[OLLAMA CONSOLE] Using direct TCP connection path");
+        
+        // Парсим URL для получения хоста и порта (синхронно, до async контекста)
+        let url = url::Url::parse(api_url)?;
+        let host = url.host_str().unwrap_or("localhost").to_string();
+        let port = url.port().unwrap_or(11434);
+        let addr = format!("{}:{}", host, port);
+        
+        let request_json = serde_json::to_string(&request)?;
+        
+        // Создаем поток ВНЕ async контекста - в синхронной функции
+        // Это должно помочь избежать влияния планировщика async runtime на поток
+        let _thread_handle = spawn_ollama_reader_thread(addr, host, request_json);
+        
+        // Сохраняем cancel_tx для возможности отмены потока
+        // TODO: нужно добавить механизм отмены через возвращаемый stream
+        // Пока поток работает независимо и завершится сам при EOF или ошибке
+        
+        // Возвращаем пустой stream - данные НЕ идут в UI, только в консоль
+        // Это полностью отвязывает от UI
+        Ok(futures::stream::empty().boxed())
     } else {
-        let mut body = String::new();
-        response.body_mut().read_to_string(&mut body).await?;
-        anyhow::bail!(
-            "Failed to connect to Ollama API: {} {}",
-            response.status(),
-            body,
-        );
+        log::info!("[OLLAMA STREAM] Using remote HTTP client path (is_local={}, has_api_key={})", is_local, api_key.is_some());
+        eprintln!("[OLLAMA CONSOLE] Using remote HTTP client path");
+        // Для удаленных запросов используем обычный HTTP client
+        let uri = format!("{api_url}/api/chat");
+        let http_request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("Content-Type", "application/json")
+            .when_some(api_key, |builder, api_key| {
+                builder.header("Authorization", format!("Bearer {api_key}"))
+            })
+            .body(AsyncBody::from(serde_json::to_string(&request)?))?;
+        
+        let mut response = client.send(http_request).await?;
+        if response.status().is_success() {
+            log::info!("[OLLAMA STREAM] Starting remote stream request");
+            let body = response.into_body();
+            
+            // Используем отдельный smol runtime в отдельном потоке для чтения стрима
+            let (tx, rx) = futures::channel::mpsc::unbounded::<Result<ChatResponseDelta>>();
+            let mut body = body;
+            
+            std::thread::spawn(move || {
+                smol::block_on(async move {
+                    let mut buffer = String::new();
+                    let mut _count = 0u64;
+                    
+                    loop {
+                        if let Some(newline_pos) = buffer.find('\n') {
+                            let line = buffer[..newline_pos].trim().to_string();
+                            buffer = buffer[newline_pos + 1..].to_string();
+                            
+                            if line.is_empty() {
+                                continue;
+                            }
+                            
+                            if line.chars().all(|c| c.is_ascii_hexdigit()) {
+                                continue;
+                            }
+                            
+                            _count += 1;
+                            let result: Result<ChatResponseDelta> = match serde_json::from_str(&line) {
+                                Ok(delta) => Ok(delta),
+                                Err(e) => {
+                                    log::debug!("[OLLAMA STREAM] Failed to parse line: {} (line: {}...)", e, line.chars().take(100).collect::<String>());
+                                    continue;
+                                }
+                            };
+                            
+                            if tx.unbounded_send(result).is_err() {
+                                break;
+                            }
+                        } else {
+                            let mut chunk = vec![0u8; 256];
+                            match body.read(&mut chunk).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buffer.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                                }
+                                Err(e) => {
+                                    let _ = tx.unbounded_send(Err(anyhow::anyhow!(e)));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+            
+            let stream = rx.map(|result| result);
+            Ok(stream.boxed())
+        } else {
+            let mut body = String::new();
+            response.body_mut().read_to_string(&mut body).await?;
+            anyhow::bail!(
+                "Failed to connect to Ollama API: {} {}",
+                response.status(),
+                body,
+            );
+        }
     }
 }
+
+/* ЗАКОММЕНТИРОВАННЫЙ MOCK:
+        // ЗАГЛУШКА: Используем mock данные с задержкой 3мс через smol timer
+        log::info!("[OLLAMA STREAM FAKE] Using mock data with 3ms smol delay");
+        
+        // Используем stream::unfold как в LMStudio
+        let stream = futures::stream::unfold(
+            (0u64, std::time::Instant::now()),
+            |(mut count, start)| async move {
+                if count >= 1000 {
+                    log::info!("[OLLAMA STREAM FAKE] Reached 1000 chunks, ending stream");
+                    return None;
+                }
+                
+                count += 1;
+                let chunk_start = std::time::Instant::now();
+                
+                // Async задержка 3мс через smol timer
+                smol::Timer::after(std::time::Duration::from_millis(3)).await;
+                
+                // Генерируем мок-данные: JSON строка с символом "A"
+                let fake_json = format!(
+                    r#"{{"model":"test","created_at":"2024-01-01T00:00:00Z","message":{{"role":"assistant","content":"A"}},"done":false}}"#
+                );
+                
+                let parse_start = std::time::Instant::now();
+                let result: Result<ChatResponseDelta> = match serde_json::from_str(&fake_json) {
+                    Ok(delta) => Ok(delta),
+                    Err(e) => Err(anyhow::anyhow!(e)),
+                };
+                let parse_time = parse_start.elapsed();
+                let chunk_time = chunk_start.elapsed();
+                
+                // Логируем все события для анализа
+                if count <= 20 || count % 10 == 0 {
+                    log::info!(
+                        "[OLLAMA STREAM FAKE] Chunk #{}: generated in {}ms (parse={}ms, since_start={}ms)",
+                        count,
+                        chunk_time.as_millis(),
+                        parse_time.as_millis(),
+                        start.elapsed().as_millis()
+                    );
+                }
+                
+                Some((result, (count, start)))
+            },
+        );
+        
+        Ok(stream.boxed())
+        */
+        
+        /* ЗАКОММЕНТИРОВАННЫЙ MOCK:
+        // ЗАГЛУШКА: Используем архитектуру как в LMStudio, но с mock данными
+        log::info!("[OLLAMA STREAM FAKE] Using mock data with LMStudio architecture");
+        
+        // Используем stream::unfold как в LMStudio
+        let stream = futures::stream::unfold(
+            (0u64, std::time::Instant::now()),
+            |(mut count, start)| async move {
+                if count >= 1000 {
+                    log::info!("[OLLAMA STREAM FAKE] Reached 1000 chunks, ending stream");
+                    return None;
+                }
+                
+                count += 1;
+                let chunk_start = std::time::Instant::now();
+                
+                // Без задержки - генерируем данные мгновенно
+                
+                // Генерируем мок-данные: JSON строка с символом "A"
+                let fake_json = format!(
+                    r#"{{"model":"test","created_at":"2024-01-01T00:00:00Z","message":{{"role":"assistant","content":"A"}},"done":false}}"#
+                );
+                
+                let parse_start = std::time::Instant::now();
+                let result: Result<ChatResponseDelta> = match serde_json::from_str(&fake_json) {
+                    Ok(delta) => Ok(delta),
+                    Err(e) => Err(anyhow::anyhow!(e)),
+                };
+                let parse_time = parse_start.elapsed();
+                let chunk_time = chunk_start.elapsed();
+                
+                // Логируем все события для анализа
+                if count <= 20 || count % 10 == 0 {
+                    log::info!(
+                        "[OLLAMA STREAM FAKE] Chunk #{}: generated in {}ms (parse={}ms, since_start={}ms)",
+                        count,
+                        chunk_time.as_millis(),
+                        parse_time.as_millis(),
+                        start.elapsed().as_millis()
+                    );
+                }
+                
+                Some((result, (count, start)))
+            },
+        );
+        
+        Ok(stream.boxed())
+        */
 
 pub async fn get_models(
     client: &dyn HttpClient,

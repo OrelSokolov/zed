@@ -194,7 +194,7 @@ impl LanguageModelProvider for GoogleLanguageModelProvider {
                     name: model.name.clone(),
                     display_name: model.display_name.clone(),
                     max_tokens: model.max_tokens,
-                    mode: model.mode.unwrap_or_default(),
+                    mode: model.mode.clone().unwrap_or_default(),
                 },
             );
         }

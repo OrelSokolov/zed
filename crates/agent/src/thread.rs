@@ -1373,41 +1373,140 @@ impl Thread {
                 Ok(events) => (events, None),
                 Err(err) => (stream::empty().boxed(), Some(err)),
             };
+            
+            // Используем отдельный smol runtime в отдельном потоке для независимого опроса стрима
+            // Это обходит проблему с планировщиком, который опрашивает futures только при обновлении UI
+            let (events_tx, mut events_rx) = mpsc::unbounded();
+            let mut cancellation_rx_bg = cancellation_rx.clone();
+            
+            // Запускаем отдельный поток с собственным smol runtime для опроса стрима
+            let stream_thread = std::thread::spawn(move || {
+                // Создаем отдельный smol runtime в этом потоке для независимого опроса
+                smol::block_on(async move {
+                    const BATCH_TIMEOUT_MS: u64 = 4; // Как в terminal.rs
+                    const MAX_BATCH_SIZE: usize = 100;
+                    
+                    let mut event_batch = Vec::new();
+                    let mut timer = futures::FutureExt::fuse(smol::Timer::after(std::time::Duration::from_millis(BATCH_TIMEOUT_MS)));
+                    futures::pin_mut!(timer);
+                    
+                    futures::pin_mut!(events);
+                    
+                    loop {
+                        futures::select_biased! {
+                            _ = futures::FutureExt::fuse(cancellation_rx_bg.changed()) => {
+                                if *cancellation_rx_bg.borrow() {
+                                    // Отправляем оставшиеся события перед отменой
+                                    if !event_batch.is_empty() {
+                                        let _ = events_tx.unbounded_send(std::mem::take(&mut event_batch));
+                                    }
+                                    break;
+                                }
+                            }
+                            event = futures::FutureExt::fuse(events.next()) => {
+                                match event {
+                                    Some(Ok(event)) => {
+                                        event_batch.push(Ok(event));
+                                        
+                                        // Отправляем батч если он достиг максимального размера
+                                        if event_batch.len() >= MAX_BATCH_SIZE {
+                                            let batch = std::mem::take(&mut event_batch);
+                                            if events_tx.unbounded_send(batch).is_err() {
+                                                break; // Получатель закрыт
+                                            }
+                                            timer.set(futures::FutureExt::fuse(smol::Timer::after(std::time::Duration::from_millis(BATCH_TIMEOUT_MS))));
+                                        }
+                                    }
+                                    Some(Err(err)) => {
+                                        // Отправляем ошибку и оставшиеся события
+                                        if !event_batch.is_empty() {
+                                            let _ = events_tx.unbounded_send(std::mem::take(&mut event_batch));
+                                        }
+                                        let _ = events_tx.unbounded_send(vec![Err(err)]);
+                                        break;
+                                    }
+                                    None => {
+                                        // Стрим закончился, отправляем оставшиеся события
+                                        if !event_batch.is_empty() {
+                                            let _ = events_tx.unbounded_send(std::mem::take(&mut event_batch));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = timer => {
+                                // Таймер истек, отправляем батч
+                                if !event_batch.is_empty() {
+                                    let batch = std::mem::take(&mut event_batch);
+                                    if events_tx.unbounded_send(batch).is_err() {
+                                        break; // Получатель закрыт
+                                    }
+                                }
+                                timer.set(futures::FutureExt::fuse(smol::Timer::after(std::time::Duration::from_millis(BATCH_TIMEOUT_MS))));
+                            }
+                        }
+                    }
+                });
+            });
+            
             let mut tool_results = FuturesUnordered::new();
             let mut cancelled = false;
-            loop {
-                // Race between getting the next event and cancellation
-                let event = futures::select! {
-                    event = events.next().fuse() => event,
-                    _ = cancellation_rx.changed().fuse() => {
-                        if *cancellation_rx.borrow() {
-                            cancelled = true;
+            
+            // Обрабатываем батчи событий в foreground
+            while let Some(event_batch) = events_rx.next().await {
+                if *cancellation_rx.borrow() {
+                    cancelled = true;
+                    break;
+                }
+                
+                // Обрабатываем первое событие сразу для низкой задержки
+                let mut batch_iter = event_batch.into_iter();
+                if let Some(first_event) = batch_iter.next() {
+                    match first_event {
+                        Ok(event) => {
+                            tool_results.extend(this.update(cx, |this, cx| {
+                                this.handle_completion_event(
+                                    event,
+                                    &event_stream,
+                                    cancellation_rx.clone(),
+                                    cx,
+                                )
+                            })??);
+                        }
+                        Err(err) => {
+                            error = Some(err);
                             break;
                         }
-                        continue;
                     }
-                };
-                let Some(event) = event else {
-                    break;
-                };
-                log::trace!("Received completion event: {:?}", event);
-                match event {
-                    Ok(event) => {
-                        tool_results.extend(this.update(cx, |this, cx| {
-                            this.handle_completion_event(
-                                event,
-                                event_stream,
-                                cancellation_rx.clone(),
-                                cx,
-                            )
-                        })??);
-                    }
-                    Err(err) => {
-                        error = Some(err);
+                }
+                
+                // Обрабатываем остальные события батча
+                for event in batch_iter {
+                    if *cancellation_rx.borrow() {
+                        cancelled = true;
                         break;
+                    }
+                    match event {
+                        Ok(event) => {
+                            tool_results.extend(this.update(cx, |this, cx| {
+                                this.handle_completion_event(
+                                    event,
+                                    &event_stream,
+                                    cancellation_rx.clone(),
+                                    cx,
+                                )
+                            })??);
+                        }
+                        Err(err) => {
+                            error = Some(err);
+                            break;
+                        }
                     }
                 }
             }
+            
+            // Ждем завершения потока со стримом
+            let _ = stream_thread.join();
 
             let end_turn = tool_results.is_empty();
             while let Some(tool_result) = tool_results.next().await {

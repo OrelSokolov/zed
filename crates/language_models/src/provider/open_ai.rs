@@ -154,6 +154,10 @@ impl LanguageModelProvider for OpenAiLanguageModelProvider {
 
         // Override with available models from settings
         for model in &OpenAiLanguageModelProvider::settings(cx).available_models {
+            let reasoning_effort = match &model.mode {
+                Some(settings::ModelMode::Reasoning { effort }) => Some(effort.clone()),
+                _ => model.reasoning_effort.clone(),
+            };
             models.insert(
                 model.name.clone(),
                 open_ai::Model::Custom {
@@ -162,7 +166,7 @@ impl LanguageModelProvider for OpenAiLanguageModelProvider {
                     max_tokens: model.max_tokens,
                     max_output_tokens: model.max_output_tokens,
                     max_completion_tokens: model.max_completion_tokens,
-                    reasoning_effort: model.reasoning_effort.clone(),
+                    reasoning_effort,
                     supports_chat_completions: model.capabilities.chat_completions,
                 },
             );

@@ -1,0 +1,18 @@
+[package]
+name = "test_ollama_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+reqwest_client = { path = "../crates/reqwest_client" }
+http_client = { path = "../crates/http_client" }
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+

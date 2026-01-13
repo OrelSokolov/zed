@@ -203,7 +203,7 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
                 max_tokens: model.max_tokens,
                 supports_tools: model.supports_tools,
                 supports_images: model.supports_images,
-                mode: model.mode.unwrap_or_default(),
+                mode: model.mode.clone().unwrap_or_default(),
                 provider: model.provider.clone(),
             });
         }
@@ -482,15 +482,22 @@ pub fn into_open_router(
             None
         },
         usage: open_router::RequestUsage { include: true },
-        reasoning: if request.thinking_allowed
-            && let OpenRouterModelMode::Thinking { budget_tokens } = model.mode
-        {
-            Some(open_router::Reasoning {
-                effort: None,
-                max_tokens: budget_tokens,
-                exclude: Some(false),
-                enabled: Some(true),
-            })
+        reasoning: if request.thinking_allowed {
+            match model.mode {
+                OpenRouterModelMode::Thinking { budget_tokens } => {
+                    Some(open_router::Reasoning {
+                        effort: None,
+                        max_tokens: budget_tokens,
+                        exclude: Some(false),
+                        enabled: Some(true),
+                    })
+                }
+                OpenRouterModelMode::Reasoning { .. } => {
+                    // Reasoning effort is OpenAI-specific, ignore for OpenRouter
+                    None
+                }
+                OpenRouterModelMode::Default => None,
+            }
         } else {
             None
         },

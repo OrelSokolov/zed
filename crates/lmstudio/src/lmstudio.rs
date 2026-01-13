@@ -397,29 +397,44 @@ pub async fn stream_chat_completion(
     let request = request_builder.body(AsyncBody::from(serde_json::to_string(&request)?))?;
     let mut response = client.send(request).await?;
     if response.status().is_success() {
-        let reader = BufReader::new(response.into_body());
-        Ok(reader
-            .lines()
-            .filter_map(|line| async move {
-                match line {
-                    Ok(line) => {
-                        let line = line.strip_prefix("data: ")?;
-                        if line == "[DONE]" {
-                            None
-                        } else {
-                            match serde_json::from_str(line) {
-                                Ok(ResponseStreamResult::Ok(response)) => Some(Ok(response)),
-                                Ok(ResponseStreamResult::Err { error, .. }) => {
-                                    Some(Err(anyhow!(error.message)))
-                                }
-                                Err(error) => Some(Err(anyhow!(error))),
-                            }
-                        }
-                    }
-                    Err(error) => Some(Err(anyhow!(error))),
+        // ЗАГЛУШКА: Используем mock данные как в Ollama для сравнения
+        eprintln!("[LMSTUDIO STREAM FAKE] Using mock data instead of real read");
+        
+        // Используем stream::unfold как в Ollama
+        let stream = futures::stream::unfold(
+            (0u64, std::time::Instant::now()),
+            |(mut count, start)| async move {
+                if count >= 1000 {
+                    eprintln!("[LMSTUDIO STREAM FAKE] Reached 1000 chunks, ending stream");
+                    return None;
                 }
-            })
-            .boxed())
+                
+                count += 1;
+                
+                // Синхронная задержка 3мс прямо в потоке генерации mock данных
+                std::thread::sleep(std::time::Duration::from_millis(3));
+                
+                if count <= 5 || count % 50 == 0 {
+                    eprintln!("[LMSTUDIO STREAM FAKE] Chunk #{} at {}ms", count, start.elapsed().as_millis());
+                }
+                
+                // Генерируем мок-данные: SSE формат с JSON
+                let fake_data = format!(
+                    r#"{{"created":123,"model":"test","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"content":"A"}},"finish_reason":null}}]}}"#
+                );
+                let fake_line = format!("data: {}\n", fake_data);
+                
+                let result: Result<ResponseStreamEvent> = match serde_json::from_str(&fake_data) {
+                    Ok(ResponseStreamResult::Ok(response)) => Ok(response),
+                    Ok(ResponseStreamResult::Err { error, .. }) => Err(anyhow::anyhow!(error.message)),
+                    Err(error) => Err(anyhow::anyhow!(error)),
+                };
+                
+                Some((result, (count, start)))
+            },
+        );
+        
+        Ok(stream.boxed())
     } else {
         let mut body = String::new();
         response.body_mut().read_to_string(&mut body).await?;

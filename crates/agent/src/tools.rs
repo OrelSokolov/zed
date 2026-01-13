@@ -19,6 +19,9 @@ mod terminal_tool;
 mod thinking_tool;
 mod web_search_tool;
 
+#[cfg(test)]
+mod test_find_path;
+
 use crate::AgentTool;
 use language_model::{LanguageModelRequestTool, LanguageModelToolSchemaFormat};
 

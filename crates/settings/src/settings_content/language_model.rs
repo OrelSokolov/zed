@@ -208,11 +208,13 @@ pub struct OpenAiAvailableModel {
     pub max_output_tokens: Option<u64>,
     pub max_completion_tokens: Option<u64>,
     pub reasoning_effort: Option<OpenAiReasoningEffort>,
+    /// The model's mode (e.g. thinking, reasoning)
+    pub mode: Option<ModelMode>,
     #[serde(default)]
     pub capabilities: OpenAiModelCapabilities,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, JsonSchema, MergeFrom)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy, JsonSchema, MergeFrom)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenAiReasoningEffort {
     Minimal,
@@ -433,7 +435,7 @@ pub struct LanguageModelCacheConfiguration {
 }
 
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+    Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
 )]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ModelMode {
@@ -442,5 +444,9 @@ pub enum ModelMode {
     Thinking {
         /// The maximum number of tokens to use for reasoning. Must be lower than the model's `max_output_tokens`.
         budget_tokens: Option<u32>,
+    },
+    Reasoning {
+        /// The reasoning effort level for OpenAI models (low, medium, high, minimal).
+        effort: OpenAiReasoningEffort,
     },
 }

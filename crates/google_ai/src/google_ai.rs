@@ -607,7 +607,7 @@ impl Model {
                 }
             }
             Self::Gemini3Flash => GoogleModelMode::Default,
-            Self::Custom { mode, .. } => *mode,
+            Self::Custom { mode, .. } => mode.clone(),
         }
     }
 }

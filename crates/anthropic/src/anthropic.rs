@@ -39,6 +39,7 @@ impl From<ModelMode> for AnthropicModelMode {
         match value {
             ModelMode::Default => AnthropicModelMode::Default,
             ModelMode::Thinking { budget_tokens } => AnthropicModelMode::Thinking { budget_tokens },
+            ModelMode::Reasoning { .. } => AnthropicModelMode::Default,
         }
     }
 }

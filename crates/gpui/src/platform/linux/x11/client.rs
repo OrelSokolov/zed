@@ -313,6 +313,22 @@ impl X11Client {
                         // events have higher priority and runnables are only worked off after the event
                         // callbacks.
                         handle.insert_idle(|_| {
+                            // Логируем частоту обработки runnables на главном потоке
+                            use std::sync::atomic::{AtomicU64, Ordering};
+                            static RUNNABLE_COUNT: AtomicU64 = AtomicU64::new(0);
+                            static LAST_RUNNABLE_LOG: AtomicU64 = AtomicU64::new(0);
+                            static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+                            let start_time = START_TIME.get_or_init(|| Instant::now());
+                            
+                            let runnable_count = RUNNABLE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                            let elapsed = start_time.elapsed();
+                            
+                            if runnable_count % 1000 == 0 || elapsed.as_secs() > LAST_RUNNABLE_LOG.load(Ordering::Relaxed) {
+                                let runnables_per_sec = runnable_count as f64 / elapsed.as_secs_f64();
+                                log::info!("[MAIN THREAD RUNNABLE] Processed {} runnables in {:.2}s, {:.2} runnables/sec", runnable_count, elapsed.as_secs_f64(), runnables_per_sec);
+                                LAST_RUNNABLE_LOG.store(elapsed.as_secs(), Ordering::Relaxed);
+                            }
+                            
                             let start = Instant::now();
                             let mut timing = match runnable {
                                 RunnableVariant::Meta(runnable) => {
