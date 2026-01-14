@@ -24,6 +24,7 @@ use crate::{
     acp::AcpThreadView,
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
     slash_command::SlashCommandCompletionProvider,
+    tabs::{AgentTab, AgentTabs, TabType},
     text_thread_editor::{AgentPanelDelegate, TextThreadEditor, make_lsp_adapter_delegate},
     ui::{AgentOnboardingModal, EndTrialUpsell},
 };
@@ -74,6 +75,9 @@ use zed_actions::{
     assistant::{OpenRulesLibrary, ToggleFocus},
 };
 
+// Import tab actions from crate
+use crate::{CloseAgentTab, NewAgentTab, NextAgentTab, PreviousAgentTab};
+
 const AGENT_PANEL_KEY: &str = "agent_panel";
 const RECENTLY_UPDATED_MENU_LIMIT: usize = 6;
 const DEFAULT_THREAD_TITLE: &str = "New Thread";
@@ -82,6 +86,25 @@ const DEFAULT_THREAD_TITLE: &str = "New Thread";
 struct SerializedAgentPanel {
     width: Option<Pixels>,
     selected_agent: Option<AgentType>,
+    tabs: Vec<SerializedTab>,
+    active_tab_index: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SerializedTab {
+    id: uuid::Uuid,
+    title: SharedString,
+    tab_type: SerializedTabType,
+    created_at: u64, // Unix timestamp in seconds
+    session_id: Option<agent_client_protocol::SessionId>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+enum SerializedTabType {
+    ExternalAgentThread,
+    TextThread,
+    History,
+    Configuration,
 }
 
 pub fn init(cx: &mut App) {
@@ -444,12 +467,38 @@ pub struct AgentPanel {
     onboarding: Entity<AgentPanelOnboarding>,
     selected_agent: AgentType,
     show_trust_workspace_message: bool,
+    tabs: AgentTabs,
+    tab_views: Vec<Option<ActiveView>>,
+    active_tab_index: usize,
 }
 
 impl AgentPanel {
     fn serialize(&mut self, cx: &mut Context<Self>) {
         let width = self.width;
         let selected_agent = self.selected_agent.clone();
+
+        // Serialize tabs
+        let tabs = self
+            .tabs
+            .tabs()
+            .iter()
+            .map(|tab| {
+                let tab_type = match tab.tab_type {
+                    TabType::Thread => SerializedTabType::ExternalAgentThread,
+                    TabType::TextThread => SerializedTabType::TextThread,
+                    TabType::History => SerializedTabType::History,
+                    TabType::Configuration => SerializedTabType::Configuration,
+                };
+
+                SerializedTab {
+                    id: tab.id,
+                    title: tab.title.clone(),
+                    tab_type,
+                    created_at: tab.created_at.elapsed().as_secs(),
+                    session_id: tab.session_id.clone(),
+                }
+            })
+            .collect();
         self.pending_serialization = Some(cx.background_spawn(async move {
             KEY_VALUE_STORE
                 .write_kvp(
@@ -457,6 +506,8 @@ impl AgentPanel {
                     serde_json::to_string(&SerializedAgentPanel {
                         width,
                         selected_agent: Some(selected_agent),
+                        tabs,
+                        active_tab_index: 0, // We'll restore to first tab
                     })?,
                 )
                 .await?;
@@ -511,6 +562,17 @@ impl AgentPanel {
                             panel.selected_agent = selected_agent.clone();
                             panel.new_agent_thread(selected_agent, window, cx);
                         }
+
+                        // Restore tabs if any were saved
+                        if !serialized_panel.tabs.is_empty() {
+                            panel.restore_tabs(
+                                serialized_panel.tabs,
+                                serialized_panel.active_tab_index,
+                                window,
+                                cx,
+                            );
+                        }
+
                         cx.notify();
                     });
                 } else {
@@ -673,6 +735,15 @@ impl AgentPanel {
             None
         };
 
+        // Initialize tabs with the default view
+        let mut tabs = AgentTabs::new();
+        let title = match &active_view {
+            ActiveView::ExternalAgentThread { thread_view } => thread_view.read(cx).title(cx),
+            _ => "New Thread".into(),
+        };
+        let default_tab = AgentTab::new(title, TabType::History);
+        tabs.add_tab(default_tab);
+
         let mut panel = Self {
             active_view,
             workspace,
@@ -703,10 +774,40 @@ impl AgentPanel {
             selected_agent: AgentType::default(),
             loading: false,
             show_trust_workspace_message: false,
+            tabs,
+            tab_views: vec![None],
+            active_tab_index: 0,
         };
 
         // Initial sync of agent servers from extensions
         panel.sync_agent_servers_from_extensions(cx);
+
+        // Move the initial active_view into tab_views
+        let initial_view = std::mem::replace(&mut panel.active_view, ActiveView::Configuration);
+        panel.tab_views[0] = Some(initial_view);
+        // Restore active_view from tab_views (we need to clone it manually)
+        let view_to_restore = match &panel.tab_views[0] {
+            Some(ActiveView::ExternalAgentThread { thread_view }) => {
+                ActiveView::ExternalAgentThread { thread_view: thread_view.clone() }
+            }
+            Some(ActiveView::TextThread { text_thread_editor, title_editor, buffer_search_bar, .. }) => {
+                ActiveView::TextThread {
+                    text_thread_editor: text_thread_editor.clone(),
+                    title_editor: title_editor.clone(),
+                    buffer_search_bar: buffer_search_bar.clone(),
+                    _subscriptions: vec![],
+                }
+            }
+            Some(ActiveView::History { kind }) => {
+                ActiveView::History { kind: *kind }
+            }
+            Some(ActiveView::Configuration) => {
+                ActiveView::Configuration
+            }
+            None => ActiveView::Configuration,
+        };
+        panel.active_view = view_to_restore;
+
         panel
     }
 
@@ -780,7 +881,14 @@ impl AgentPanel {
     }
 
     fn new_thread(&mut self, _action: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_agent_thread(AgentType::NativeAgent, window, cx);
+        let ext_agent = ExternalAgent::NativeAgent;
+        self.external_thread(
+            Some(ext_agent),
+            None,
+            None,
+            window,
+            cx,
+        );
     }
 
     fn new_native_agent_thread_from_summary(
@@ -835,7 +943,8 @@ impl AgentPanel {
             self.serialize(cx);
         }
 
-        self.set_active_view(
+        self.add_new_tab(
+            "New Text Thread",
             ActiveView::text_thread(
                 text_thread_editor.clone(),
                 self.language_registry.clone(),
@@ -980,17 +1089,25 @@ impl AgentPanel {
             return;
         };
 
-        if let ActiveView::History { kind: active_kind } = self.active_view {
-            if active_kind == kind {
-                if let Some(previous_view) = self.previous_view.take() {
-                    self.set_active_view(previous_view, true, window, cx);
-                }
+        // Check if we already have a history tab open
+        if let Some(tab) = self.tabs.find_tab_by_type(TabType::History) {
+            if let Some(index) = self.tabs.index_of(tab.id) {
+                self.select_tab(index, window, cx);
                 return;
             }
         }
 
-        self.set_active_view(ActiveView::History { kind }, true, window, cx);
-        cx.notify();
+        let history_title = match kind {
+            HistoryKind::AgentThreads => "Agent Threads History",
+            HistoryKind::TextThreads => "Text Threads History",
+        };
+        self.add_new_tab(
+            history_title,
+            ActiveView::History { kind },
+            true,
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn open_saved_text_thread(
@@ -1016,6 +1133,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Get title from text thread before moving it
+        let title = text_thread.read(cx).summary().or_default();
+
         let lsp_adapter_delegate = make_lsp_adapter_delegate(&self.project.clone(), cx)
             .log_err()
             .flatten();
@@ -1035,8 +1155,8 @@ impl AgentPanel {
             self.selected_agent = AgentType::TextThread;
             self.serialize(cx);
         }
-
-        self.set_active_view(
+        self.add_new_tab(
+            title,
             ActiveView::text_thread(editor, self.language_registry.clone(), window, cx),
             true,
             window,
@@ -1183,12 +1303,19 @@ impl AgentPanel {
     }
 
     pub(crate) fn open_configuration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Check if we already have a configuration tab open
+        if let Some(tab) = self.tabs.find_tab_by_type(TabType::Configuration) {
+            if let Some(index) = self.tabs.index_of(tab.id) {
+                self.select_tab(index, window, cx);
+                return;
+            }
+        }
+
         let agent_server_store = self.project.read(cx).agent_server_store().clone();
         let context_server_store = self.project.read(cx).context_server_store();
         let fs = self.fs.clone();
 
-        self.set_active_view(ActiveView::Configuration, true, window, cx);
-        self.configuration = Some(cx.new(|cx| {
+        let configuration = cx.new(|cx| {
             AgentConfiguration::new(
                 fs,
                 agent_server_store,
@@ -1199,16 +1326,29 @@ impl AgentPanel {
                 window,
                 cx,
             )
-        }));
+        });
 
-        if let Some(configuration) = self.configuration.as_ref() {
+        // Store configuration entity before adding tab
+        self.configuration = Some(configuration.clone());
+
+        if let Some(config) = self.configuration.as_ref() {
             self.configuration_subscription = Some(cx.subscribe_in(
-                configuration,
+                config,
                 window,
                 Self::handle_agent_configuration_event,
             ));
+        }
 
-            configuration.focus_handle(cx).focus(window, cx);
+        self.add_new_tab(
+            "Configuration",
+            ActiveView::Configuration,
+            true,
+            window,
+            cx,
+        );
+
+        if let Some(config) = self.configuration.as_ref() {
+            config.focus_handle(cx).focus(window, cx);
         }
     }
 
@@ -1341,6 +1481,593 @@ impl AgentPanel {
         }
     }
 
+    // ============================================================================
+    // TAB MANAGEMENT METHODS
+    // ============================================================================
+
+    /// Adds a new tab to the panel
+    ///
+    /// This creates a new tab with the given title and active view.
+    /// All existing tabs are marked as inactive, and the new tab becomes active.
+    fn add_new_tab(
+        &mut self,
+        title: impl Into<SharedString>,
+        active_view: ActiveView,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Determine tab type from active view
+        let tab_type = match &active_view {
+            ActiveView::ExternalAgentThread { .. } => TabType::Thread,
+            ActiveView::TextThread { .. } => TabType::TextThread,
+            ActiveView::History { .. } => TabType::History,
+            ActiveView::Configuration => TabType::Configuration,
+        };
+
+        let mut tab = AgentTab::new(title, tab_type);
+
+        // Extract session_id if this is a thread view
+        if let ActiveView::ExternalAgentThread { ref thread_view } = active_view {
+            if let Some(thread) = thread_view.read(cx).thread() {
+                tab.session_id = Some(thread.read(cx).session_id().clone());
+            }
+        }
+
+        // Store the current active view before switching
+        let old_view = std::mem::replace(&mut self.active_view, ActiveView::Configuration);
+        let old_index = self.active_tab_index;
+
+        // Save the old view to its tab_views slot
+        if !self.tabs.is_empty() && old_index < self.tab_views.len() {
+            self.tab_views[old_index] = Some(old_view);
+        } else if !self.tabs.is_empty() {
+            // Old index is out of bounds, append
+            while self.tab_views.len() < old_index {
+                self.tab_views.push(None);
+            }
+            self.tab_views.push(Some(old_view));
+        }
+
+        // Deactivate all existing tabs
+        for tab in self.tabs.tabs_mut() {
+            tab.is_active = false;
+        }
+
+        // Add the new tab
+        self.tabs.add_tab(tab);
+
+        // Store the view for this new tab
+        let new_index = self.tabs.active_index();
+        while self.tab_views.len() <= new_index {
+            self.tab_views.push(None);
+        }
+        self.tab_views[new_index] = Some(active_view);
+        self.active_tab_index = new_index;
+
+        // Handle focus if requested
+        if focus {
+            self.focus_handle(cx).focus(window, cx);
+        }
+
+        // Notify to trigger re-render
+        cx.notify();
+
+        // Save state
+        self.serialize(cx);
+    }
+
+    /// Selects a tab by index
+    ///
+    /// Returns `Some(&AgentTab)` if index is valid, `None` otherwise.
+    fn select_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.tab_count() {
+            return;
+        }
+
+        // Get tab info before selecting (to avoid multiple borrows)
+        let tab_type = self.tabs.tabs().get(index).map(|t| t.tab_type);
+
+        // Use AgentTabs to select the tab
+        if self.tabs.select_tab(index).is_some() {
+            let tab_type = tab_type.unwrap();
+            // Store the current active view before switching
+            let old_view = std::mem::replace(&mut self.active_view, ActiveView::Configuration);
+            let old_index = self.active_tab_index;
+
+            // Save the old view to its tab_views slot
+            if old_index < self.tab_views.len() {
+                self.tab_views[old_index] = Some(old_view);
+            } else {
+                // Old index is out of bounds, extend the vector
+                while self.tab_views.len() <= old_index {
+                    self.tab_views.push(None);
+                }
+                self.tab_views[old_index] = Some(old_view);
+            }
+
+            // Get the view for the new tab
+            let new_view = if index < self.tab_views.len() {
+                self.tab_views[index].take()
+            } else {
+                None
+            };
+
+                // Restore the view for the selected tab
+                if let Some(view) = new_view {
+                    self.active_view = view;
+                } else {
+                    // If view is missing, create a default view based on tab type
+                    self.active_view = match tab_type {
+                    TabType::History => ActiveView::History {
+                        kind: HistoryKind::AgentThreads,
+                    },
+                    TabType::Configuration => {
+                        // Recreate configuration if needed
+                        if self.configuration.is_none() {
+                            let agent_server_store = self.project.read(cx).agent_server_store().clone();
+                            let context_server_store = self.project.read(cx).context_server_store();
+                            let fs = self.fs.clone();
+                            let configuration = cx.new(|cx| {
+                                AgentConfiguration::new(
+                                    fs,
+                                    agent_server_store,
+                                    context_server_store,
+                                    self.context_server_registry.clone(),
+                                    self.language_registry.clone(),
+                                    self.workspace.clone(),
+                                    window,
+                                    cx,
+                                )
+                            });
+                            self.configuration = Some(configuration.clone());
+                            if let Some(config) = self.configuration.as_ref() {
+                                self.configuration_subscription = Some(cx.subscribe_in(
+                                    config,
+                                    window,
+                                    Self::handle_agent_configuration_event,
+                                ));
+                            }
+                        }
+                        ActiveView::Configuration
+                    }
+                    TabType::Thread => {
+                        // Create a default thread view
+                        // Note: This creates a new thread, but we should ideally restore the original
+                        // For now, create a default one
+                        let view = self.create_default_native_thread(window, cx);
+                        view
+                    }
+                    TabType::TextThread => {
+                        // Create a default text thread
+                        let context = self
+                            .text_thread_store
+                            .update(cx, |context_store, cx| context_store.create(cx));
+                        let lsp_adapter_delegate = make_lsp_adapter_delegate(&self.project, cx)
+                            .log_err()
+                            .flatten();
+                        let text_thread_editor = cx.new(|cx| {
+                            let mut editor = TextThreadEditor::for_text_thread(
+                                context,
+                                self.fs.clone(),
+                                self.workspace.clone(),
+                                self.project.clone(),
+                                lsp_adapter_delegate,
+                                window,
+                                cx,
+                            );
+                            editor.insert_default_prompt(window, cx);
+                            editor
+                        });
+                        ActiveView::text_thread(
+                            text_thread_editor,
+                            self.language_registry.clone(),
+                            window,
+                            cx,
+                        )
+                    }
+                };
+                // Save the newly created view
+                while self.tab_views.len() <= index {
+                    self.tab_views.push(None);
+                }
+                // Save the view to tab_views for persistence
+                // We need to clone it because it's stored elsewhere in self.active_view
+                let view_to_save = match &self.active_view {
+                    ActiveView::ExternalAgentThread { thread_view } => {
+                        ActiveView::ExternalAgentThread { thread_view: thread_view.clone() }
+                    }
+                    ActiveView::TextThread { text_thread_editor, title_editor, buffer_search_bar, .. } => {
+                        ActiveView::TextThread {
+                            text_thread_editor: text_thread_editor.clone(),
+                            title_editor: title_editor.clone(),
+                            buffer_search_bar: buffer_search_bar.clone(),
+                            _subscriptions: vec![],
+                        }
+                    }
+                    ActiveView::History { kind } => {
+                        ActiveView::History { kind: *kind }
+                    }
+                    ActiveView::Configuration => {
+                        ActiveView::Configuration
+                    }
+                };
+                self.tab_views[index] = Some(view_to_save);
+            }
+
+            self.active_tab_index = index;
+
+            // Update previous_view for special views
+            match tab_type {
+                TabType::History | TabType::Configuration => {
+                    // Keep previous_view for special views
+                }
+                _ => {
+                    self.previous_view = None;
+                }
+            }
+
+            cx.notify();
+        }
+    }
+
+    /// Closes a tab by index
+    ///
+    /// The last tab cannot be closed; it is replaced with a new empty thread.
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.tab_count() {
+            return;
+        }
+
+        // Don't allow closing the last tab - replace with new thread instead
+        if self.tabs.tab_count() == 1 {
+            self.new_thread(&NewThread, window, cx);
+            return;
+        }
+
+        // Remove the view for this tab
+        if index < self.tab_views.len() {
+            self.tab_views.remove(index);
+        }
+
+        // Remove the tab using AgentTabs
+        if let Some(_closed_tab) = self.tabs.close_tab(index) {
+            // Update active view if we closed the active tab
+            if let Some(_active_tab) = self.tabs.active_tab() {
+                let new_index = self.tabs.active_index();
+                if new_index < self.tab_views.len() && self.tab_views[new_index].is_some() {
+                    let view = self.tab_views[new_index].take().unwrap();
+                    self.active_view = view;
+                    self.active_tab_index = new_index;
+                }
+            } else if !self.tabs.is_empty() {
+                // Select the first available tab
+                self.select_tab(0, window, cx);
+            }
+
+            cx.notify();
+            self.serialize(cx);
+        }
+    }
+
+    /// Moves to the next tab (wraps around to first tab)
+    fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+
+        let new_index = self.tabs.active_index() + 1;
+        if new_index >= self.tabs.tab_count() {
+            self.select_tab(0, window, cx);
+        } else {
+            self.select_tab(new_index, window, cx);
+        }
+    }
+
+    /// Moves to the previous tab (wraps around to last tab)
+    fn previous_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+
+        let current_index = self.tabs.active_index();
+        if current_index == 0 {
+            self.select_tab(self.tabs.tab_count() - 1, window, cx);
+        } else {
+            self.select_tab(current_index - 1, window, cx);
+        }
+    }
+
+    /// Returns a reference to the active tab
+    fn active_tab(&self) -> Option<&AgentTab> {
+        self.tabs.active_tab()
+    }
+
+    /// Returns all tabs
+    fn tabs(&self) -> &[AgentTab] {
+        self.tabs.tabs()
+    }
+
+    /// Returns the number of tabs
+    fn tab_count(&self) -> usize {
+        self.tabs.tab_count()
+    }
+
+    /// Closes the currently active tab
+    fn close_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tabs.is_empty() {
+            self.close_tab(self.tabs.active_index(), window, cx);
+        }
+    }
+
+    /// Finds a tab by its session ID
+    fn find_tab_by_session(&self, session_id: &agent_client_protocol::SessionId) -> Option<&AgentTab> {
+        self.tabs.find_tab_by_session(session_id)
+    }
+
+    /// Updates the title of a tab by its session ID
+    fn update_tab_title(
+        &mut self,
+        session_id: &agent_client_protocol::SessionId,
+        title: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab_id) = self.tabs.find_tab_by_session(session_id).map(|t| t.id) {
+            let _ = self.tabs.update_tab_title(tab_id, title);
+            cx.notify();
+        }
+    }
+
+    /// Renders the tabs bar if there are multiple tabs
+    fn render_tabs_bar(&self, _window: &mut Window, cx: &Context<Self>) -> Option<AnyElement> {
+        if self.tabs.tab_count() <= 1 {
+            return None;
+        }
+
+        let theme = cx.theme();
+        let tabs_vec = self.tabs.tabs().to_vec();
+        let active_index = self.tabs.active_index();
+        let panel = cx.entity().downgrade();
+
+        Some(
+            h_flex()
+                .w_full()
+                .h(px(32.))
+                .border_b_1()
+                .border_color(theme.colors().border)
+                .gap(px(2.))
+                .px_2()
+                .items_center()
+                .children(tabs_vec.iter().enumerate().map(|(index, tab)| {
+                    let is_active = index == active_index;
+                    let tab_id = tab.id;
+                    let panel = panel.clone();
+
+                    div()
+                        .id(ElementId::Name(format!("agent-tab-{}", tab.id).into()))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .h_full()
+                        .min_w(px(100.))
+                        .max_w(px(200.))
+                        .px_2()
+                        .gap_2()
+                        .rounded_t_md()
+                        .cursor_pointer()
+                        .when(is_active, |this| {
+                            this.bg(theme.colors().surface_background)
+                                .border_b_2()
+                                .border_color(theme.colors().border_selected)
+                        })
+                        .when(!is_active, |this| {
+                            this.hover(|style| style.bg(theme.colors().element_hover))
+                        })
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_sm()
+                                .when(tab.is_modified, |this| this.italic())
+                                .text_color(theme.colors().text)
+                                .child(tab.title.clone()),
+                        )
+                        .when(tabs_vec.len() > 1, |this| {
+                            this.child(
+                                IconButton::new(format!("close-tab-{}", tab.id), IconName::Close)
+                                    .icon_size(IconSize::XSmall)
+                                    .on_click({
+                                        let panel = panel.clone();
+                                        move |_event, window, cx| {
+                                            if let Some(panel) = panel.upgrade() {
+                                                panel.update(cx, |panel, cx| {
+                                                    if let Some(index) = panel.tabs.index_of(tab_id)
+                                                    {
+                                                        panel.close_tab(index, window, cx);
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }),
+                            )
+                        })
+                        .on_click({
+                            let panel = panel.clone();
+                            move |_event, window, cx| {
+                                if let Some(panel) = panel.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.select_tab(index, window, cx);
+                                    });
+                                }
+                            }
+                        })
+                }))
+                .into_any(),
+        )
+    }
+
+    /// Restores tabs from serialized data
+    ///
+    /// This recreates tabs from saved state, attempting to restore
+    /// thread sessions where possible.
+    fn restore_tabs(
+        &mut self,
+        serialized_tabs: Vec<SerializedTab>,
+        active_tab_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Clear default tab that was created in new()
+        self.tabs.clear();
+        self.tab_views.clear();
+
+        // Restore each serialized tab
+        for serialized_tab in &serialized_tabs {
+            let title = serialized_tab.title.clone();
+
+            let active_view = match serialized_tab.tab_type {
+                SerializedTabType::ExternalAgentThread => {
+                    // Create a new default thread
+                    self.create_default_native_thread(window, cx)
+                }
+                SerializedTabType::TextThread => {
+                    // Create a new text thread
+                    let context = self
+                        .text_thread_store
+                        .update(cx, |store, cx| store.create(cx));
+                    let lsp_adapter_delegate = make_lsp_adapter_delegate(&self.project, cx)
+                        .log_err()
+                        .flatten();
+
+                    let text_thread_editor = cx.new(|cx| {
+                        let mut editor = TextThreadEditor::for_text_thread(
+                            context,
+                            self.fs.clone(),
+                            self.workspace.clone(),
+                            self.project.clone(),
+                            lsp_adapter_delegate,
+                            window,
+                            cx,
+                        );
+                        editor.insert_default_prompt(window, cx);
+                        editor
+                    });
+
+                    ActiveView::text_thread(
+                        text_thread_editor.clone(),
+                        self.language_registry.clone(),
+                        window,
+                        cx,
+                    )
+                }
+                SerializedTabType::History => ActiveView::History {
+                    kind: HistoryKind::AgentThreads,
+                },
+                SerializedTabType::Configuration => ActiveView::Configuration,
+            };
+
+            // Determine the tab type
+            let tab_type = match &serialized_tab.tab_type {
+                SerializedTabType::ExternalAgentThread => TabType::Thread,
+                SerializedTabType::TextThread => TabType::TextThread,
+                SerializedTabType::History => TabType::History,
+                SerializedTabType::Configuration => TabType::Configuration,
+            };
+
+            // Create tab
+            let mut tab = AgentTab::new(title, tab_type);
+            tab.id = serialized_tab.id;
+            // Don't restore session_id for now since we're not loading threads
+
+            self.tabs.add_tab(tab);
+            self.tab_views.push(Some(active_view));
+        }
+
+        // Selecting previously active tab
+        if !self.tabs.is_empty() {
+            let index_to_select = if active_tab_index < self.tabs.tab_count() {
+                active_tab_index
+            } else {
+                0
+            };
+            self.select_tab(index_to_select, window, cx);
+        }
+    }
+
+    /// Creates a thread view for restoring a tab
+    fn create_thread_for_tab(
+        &mut self,
+        thread_info: AgentSessionInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ActiveView {
+        // Create a thread view by loading from session info
+        let thread_store = self.thread_store.clone();
+        let server = Rc::new(agent::NativeAgentServer::new(
+            self.fs.clone(),
+            thread_store.clone(),
+        ));
+
+        let thread_view = cx.new(|cx| {
+            crate::acp::AcpThreadView::new(
+                server,
+                Some(thread_info),
+                None,
+                self.workspace.clone(),
+                self.project.clone(),
+                Some(thread_store),
+                self.prompt_store.clone(),
+                true,
+                window,
+                cx,
+            )
+        });
+
+        ActiveView::ExternalAgentThread { thread_view }
+    }
+
+    /// Creates a default native agent thread for a new tab
+    fn create_default_native_thread(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ActiveView {
+        let thread_view = cx.new(|cx| {
+            crate::acp::AcpThreadView::new(
+                Rc::new(agent::NativeAgentServer::new(
+                    self.fs.clone(),
+                    self.thread_store.clone(),
+                )),
+                None,
+                None,
+                self.workspace.clone(),
+                self.project.clone(),
+                Some(self.thread_store.clone()),
+                self.prompt_store.clone(),
+                true,
+                window,
+                cx,
+            )
+        });
+
+        let acp_history = self.acp_history.clone();
+        cx.observe(&thread_view, move |_, thread_view, cx| {
+            if let Some(session_list) = thread_view.read(cx).session_list() {
+                acp_history.update(cx, |history, cx| {
+                    history.set_session_list(Some(session_list), cx);
+                });
+            }
+        })
+        .detach();
+
+        ActiveView::ExternalAgentThread { thread_view }
+    }
+
+    // ============================================================================
+    // END TAB MANAGEMENT METHODS
+    // ============================================================================
+
     fn populate_recently_updated_menu_section(
         mut menu: ContextMenu,
         panel: Entity<Self>,
@@ -1471,43 +2198,76 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.selected_agent != agent {
+            self.selected_agent = agent.clone();
+            self.serialize(cx);
+        }
+
+
+
         match agent {
             AgentType::TextThread => {
                 window.dispatch_action(NewTextThread.boxed_clone(), cx);
             }
-            AgentType::NativeAgent => self.external_thread(
-                Some(crate::ExternalAgent::NativeAgent),
-                None,
-                None,
-                window,
-                cx,
-            ),
-            AgentType::Gemini => {
-                self.external_thread(Some(crate::ExternalAgent::Gemini), None, None, window, cx)
-            }
-            AgentType::ClaudeCode => {
-                self.selected_agent = AgentType::ClaudeCode;
-                self.serialize(cx);
+            AgentType::NativeAgent => {
+                let ext_agent = crate::ExternalAgent::NativeAgent;
+                let _server = ext_agent.server(self.fs.clone(), self.thread_store.clone());
                 self.external_thread(
-                    Some(crate::ExternalAgent::ClaudeCode),
+                    Some(ext_agent),
                     None,
                     None,
                     window,
                     cx,
-                )
+                );
+            }
+            AgentType::Gemini => {
+                let ext_agent = crate::ExternalAgent::Gemini;
+                let _server = ext_agent.server(self.fs.clone(), self.thread_store.clone());
+                self.external_thread(
+                    Some(ext_agent),
+                    None,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+            AgentType::ClaudeCode => {
+                self.selected_agent = AgentType::ClaudeCode;
+                self.serialize(cx);
+                let ext_agent = crate::ExternalAgent::ClaudeCode;
+                let _server = ext_agent.server(self.fs.clone(), self.thread_store.clone());
+                self.external_thread(
+                    Some(ext_agent),
+                    None,
+                    None,
+                    window,
+                    cx,
+                );
             }
             AgentType::Codex => {
                 self.selected_agent = AgentType::Codex;
                 self.serialize(cx);
-                self.external_thread(Some(crate::ExternalAgent::Codex), None, None, window, cx)
+                let ext_agent = crate::ExternalAgent::Codex;
+                let _server = ext_agent.server(self.fs.clone(), self.thread_store.clone());
+                self.external_thread(
+                    Some(ext_agent),
+                    None,
+                    None,
+                    window,
+                    cx,
+                );
             }
-            AgentType::Custom { name } => self.external_thread(
-                Some(crate::ExternalAgent::Custom { name }),
-                None,
-                None,
-                window,
-                cx,
-            ),
+            AgentType::Custom { name } => {
+                let ext_agent = crate::ExternalAgent::Custom { name };
+                let _server = ext_agent.server(self.fs.clone(), self.thread_store.clone());
+                self.external_thread(
+                    Some(ext_agent),
+                    None,
+                    None,
+                    window,
+                    cx,
+                );
+            }
         }
     }
 
@@ -1543,6 +2303,26 @@ impl AgentPanel {
             self.selected_agent = selected_agent;
             self.serialize(cx);
         }
+        // Determine the title for the new tab (before moving resume_thread/summarize_thread)
+        let tab_title = if let Some(resume_info) = &resume_thread {
+            resume_info
+                .title
+                .as_ref()
+                .filter(|title| !title.is_empty())
+                .cloned()
+                .unwrap_or_else(|| SharedString::new_static("New Thread"))
+        } else if let Some(summary_info) = &summarize_thread {
+            summary_info
+                .title
+                .as_ref()
+                .filter(|title| !title.is_empty())
+                .cloned()
+                .unwrap_or_else(|| SharedString::new_static("New Thread"))
+        } else {
+            // Default title, will be updated when thread is ready
+            SharedString::new_static("New Thread")
+        };
+
         let thread_store = server
             .clone()
             .downcast::<agent::NativeAgentServer>()
@@ -1573,12 +2353,81 @@ impl AgentPanel {
             }
         }));
 
-        self.set_active_view(
+        let acp_history = self.acp_history.clone();
+        self.history_subscription = Some(cx.observe(&thread_view, move |_, thread_view, cx| {
+            if let Some(session_list) = thread_view.read(cx).session_list() {
+                acp_history.update(cx, |history, cx| {
+                    history.set_session_list(Some(session_list), cx);
+                });
+            }
+        }));
+
+        // Add as a new tab instead of replacing the current view
+        let thread_view_clone = thread_view.clone();
+        self.add_new_tab(
+            tab_title,
             ActiveView::ExternalAgentThread { thread_view },
             !loading,
             window,
             cx,
         );
+
+        // Get the tab_id of the newly created tab
+        let tab_id = if let Some(active_tab) = self.tabs.active_tab() {
+            active_tab.id
+        } else {
+            return;
+        };
+
+        // Subscribe to thread_view to update session_id and title when thread becomes ready
+        let tab_id_for_subscription = tab_id;
+        cx.observe(&thread_view_clone, move |this, thread_view, cx| {
+            if let Some(thread) = thread_view.read(cx).thread() {
+                let session_id = thread.read(cx).session_id().clone();
+                let title = thread.read(cx).title();
+
+                // Update session_id in the tab
+                if let Some(tab) = this.tabs.find_tab_by_id_mut(&tab_id_for_subscription) {
+                    if tab.session_id.is_none() {
+                        tab.session_id = Some(session_id.clone());
+                    }
+                    // Update title if it changed
+                    if tab.title != title {
+                        tab.title = title.clone();
+                        cx.notify();
+                    }
+                }
+            }
+        }).detach();
+
+        // Subscribe to thread events for title updates
+        // Note: We'll subscribe when thread becomes available, but we can't capture window here
+        // So we'll use a simpler approach - just observe thread_view and update when title changes
+        let tab_id_for_events = tab_id;
+        cx.observe(&thread_view_clone, move |this, thread_view, cx| {
+            // This will be called whenever thread_view notifies, including title changes
+            // We can check if thread is ready and get its title
+            if let Some(thread) = thread_view.read(cx).thread() {
+                let session_id = thread.read(cx).session_id().clone();
+                let title = thread.read(cx).title();
+
+                // Update tab title
+                if let Some(tab) = this.tabs.find_tab_by_session_mut(&session_id) {
+                    if tab.title != title {
+                        tab.title = title.clone();
+                        cx.notify();
+                    }
+                } else if let Some(tab) = this.tabs.find_tab_by_id_mut(&tab_id_for_events) {
+                    if tab.title != title {
+                        tab.title = title.clone();
+                        if tab.session_id.is_none() {
+                            tab.session_id = Some(session_id);
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+        }).detach();
     }
 }
 
@@ -2864,6 +3713,21 @@ impl Render for AgentPanel {
                     thread_view.update(cx, |thread_view, cx| thread_view.reauthenticate(window, cx))
                 }
             }))
+            .on_action(cx.listener(|this, _: &NextAgentTab, window, cx| {
+                this.next_tab(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PreviousAgentTab, window, cx| {
+                this.previous_tab(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseAgentTab, window, cx| {
+                this.close_active_tab(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewAgentTab, window, cx| {
+                this.new_thread(&NewThread, window, cx);
+            }))
+            .when_some(self.render_tabs_bar(window, cx), |this, tabs_bar| {
+                this.child(tabs_bar)
+            })
             .child(self.render_toolbar(window, cx))
             .children(self.render_workspace_trust_message(cx))
             .children(self.render_onboarding(window, cx))

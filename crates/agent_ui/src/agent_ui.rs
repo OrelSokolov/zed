@@ -15,6 +15,7 @@ mod mention_set;
 mod profile_selector;
 mod slash_command;
 mod slash_command_picker;
+mod tabs;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 mod text_thread_editor;
@@ -129,6 +130,14 @@ actions!(
         SendNextQueuedMessage,
         /// Clears all messages from the queue.
         ClearMessageQueue,
+        /// Navigates to the next agent tab.
+        NextAgentTab,
+        /// Navigates to the previous agent tab.
+        PreviousAgentTab,
+        /// Creates a new agent tab.
+        NewAgentTab,
+        /// Closes the current agent tab.
+        CloseAgentTab,
     ]
 );
 
