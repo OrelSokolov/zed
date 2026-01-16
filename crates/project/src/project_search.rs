@@ -3,6 +3,7 @@ use std::{
     collections::BTreeSet,
     io::{BufRead, BufReader},
     ops::Range,
+    panic,
     path::{Path, PathBuf},
     pin::pin,
     sync::Arc,
@@ -837,7 +838,10 @@ impl PathInclusionMatcher {
         // Then, when checking whether a given directory should be scanned, we check whether it is a non-empty substring of any glob prefix.
         if query.filters_path() {
             included.extend(query.files_to_include().sources().filter_map(|glob| {
-                let prefix = wax::Glob::new(glob).ok()?.partition().0;
+                let glob = wax::Glob::new(glob).ok()?;
+                // Catch panics from wax::Glob::partition() which can panic on certain patterns
+                // (e.g., when the pattern results in an empty token vector)
+                let prefix = panic::catch_unwind(panic::AssertUnwindSafe(|| glob.partition().0)).ok()?;
                 // Skip patterns with empty prefixes (e.g., **/*.rs) to avoid panics in wax
                 (!prefix.as_os_str().is_empty()).then_some(prefix)
             }));

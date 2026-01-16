@@ -4165,6 +4165,7 @@ dependencies = [
  "smol",
  "system_specs",
  "windows 0.61.3",
+ "zlog",
  "zstd",
 ]
 

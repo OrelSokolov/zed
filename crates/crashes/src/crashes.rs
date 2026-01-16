@@ -51,6 +51,17 @@ pub async fn init(crash_init: InitCrashHandler) {
             let old_hook = panic::take_hook();
             panic::set_hook(Box::new(move |info| {
                 unsafe { env::set_var("RUST_BACKTRACE", "1") };
+                
+                // Log panic to file before calling old_hook
+                let message = info.payload_as_str().unwrap_or("Box<Any>").to_owned();
+                let location = info
+                    .location()
+                    .map_or_else(|| "<unknown>".to_owned(), |location| location.to_string());
+                let current_thread = std::thread::current();
+                let thread_name = current_thread.name().unwrap_or("<unnamed>");
+                log::error!("thread '{thread_name}' panicked at {location}:\n{message}");
+                zlog::flush();
+                
                 old_hook(info);
                 // prevent the macOS crash dialog from popping up
                 if cfg!(target_os = "macos") {
@@ -315,15 +326,19 @@ pub fn panic_hook(info: &PanicHookInfo) {
 
     let current_thread = std::thread::current();
     let thread_name = current_thread.name().unwrap_or("<unnamed>");
+    let location = info
+        .location()
+        .map_or_else(|| "<unknown>".to_owned(), |location| location.to_string());
+    
+    // Always log panic to file first, before trying crash handler
+    log::error!("thread '{thread_name}' panicked at {location}:\n{message}");
+    zlog::flush();
 
     // wait 500ms for the crash handler process to start up
     // if it's still not there just write panic info and no minidump
     let retry_frequency = Duration::from_millis(100);
     for _ in 0..5 {
         if let Some(client) = CRASH_HANDLER.get() {
-            let location = info
-                .location()
-                .map_or_else(|| "<unknown>".to_owned(), |location| location.to_string());
             log::error!("thread '{thread_name}' panicked at {location}:\n{message}...");
             client
                 .send_message(
@@ -332,6 +347,7 @@ pub fn panic_hook(info: &PanicHookInfo) {
                 )
                 .ok();
             log::error!("triggering a crash to generate a minidump...");
+            zlog::flush();
 
             #[cfg(target_os = "macos")]
             PANIC_THREAD_ID.store(
@@ -350,6 +366,12 @@ pub fn panic_hook(info: &PanicHookInfo) {
             }
         }
         thread::sleep(retry_frequency);
+    }
+    
+    // If crash handler never became available, log that too
+    if CRASH_HANDLER.get().is_none() {
+        log::error!("crash handler not available, exiting without minidump");
+        zlog::flush();
     }
 }
 

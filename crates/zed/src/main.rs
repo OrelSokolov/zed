@@ -13,7 +13,7 @@ use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
 use client::{Client, ProxySettings, UserStore, parse_zed_link};
 use collab_ui::channel_view::ChannelView;
 use collections::HashMap;
-use crashes::InitCrashHandler;
+use crashes::{CrashInfo, InitCrashHandler};
 use db::kvp::{GLOBAL_KEY_VALUE_STORE, KEY_VALUE_STORE};
 use editor::Editor;
 use extension::ExtensionHostProxy;
@@ -274,6 +274,11 @@ fn main() {
             *release_channel::RELEASE_CHANNEL,
         );
         println!("Zed System Specs (from CLI):\n{}", system_specs);
+        return;
+    }
+
+    if args.log {
+        print_crash_log();
         return;
     }
 
@@ -1436,6 +1441,96 @@ fn stdout_is_a_pty() -> bool {
     std::env::var(FORCE_CLI_MODE_ENV_VAR_NAME).ok().is_none() && io::stdout().is_terminal()
 }
 
+fn print_crash_log() {
+    let logs_dir = paths::logs_dir();
+
+    match std::fs::read_dir(logs_dir) {
+        Ok(entries) => {
+            let mut crash_files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.extension() == Some(std::ffi::OsStr::new("json")) {
+                    if let Ok(metadata) = entry.metadata() {
+                        if let Ok(modified) = metadata.modified() {
+                            crash_files.push((path, modified));
+                        }
+                    }
+                }
+            }
+
+            if crash_files.is_empty() {
+                println!("No crash logs found in {}", logs_dir.display());
+                return;
+            }
+
+            crash_files.sort_by(|a, b| b.1.cmp(&a.1));
+
+            if let Some((latest_crash_path, _)) = crash_files.first() {
+                match std::fs::read_to_string(latest_crash_path) {
+                    Ok(crash_data) => match serde_json::from_str::<CrashInfo>(&crash_data) {
+                        Ok(crash_info) => {
+                            let output = format!(
+                                "Crash Log:\n\
+                                     Version: {}\n\
+                                     Release Channel: {}\n\
+                                     Binary: {}\n\
+                                     Commit SHA: {}\n\
+                                     Session ID: {}\n\
+                                     Panic: {}\n\
+                                     Span: {}\n\
+                                     Minidump Error: {}\n\
+                                    GPUs: {}",
+                                crash_info.init.zed_version,
+                                crash_info.init.release_channel,
+                                crash_info.init.binary,
+                                crash_info.init.commit_sha,
+                                crash_info.init.session_id,
+                                crash_info
+                                    .panic
+                                    .as_ref()
+                                    .map(|p| &p.message)
+                                    .unwrap_or(&"None".to_string()),
+                                crash_info
+                                    .panic
+                                    .as_ref()
+                                    .map(|p| &p.span)
+                                    .unwrap_or(&"None".to_string()),
+                                crash_info.minidump_error.as_deref().unwrap_or("None"),
+                                crash_info
+                                    .gpus
+                                    .iter()
+                                    .map(|gpu| format!(
+                                        "{} ({})",
+                                        gpu.device_name.as_deref().unwrap_or("Unknown"),
+                                        gpu.driver_version.as_deref().unwrap_or("Unknown")
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                            println!("{}", output);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to parse crash info: {}", e);
+                            println!("Raw crash data:\n{}", crash_data);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Failed to read crash file: {}", e);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "Failed to read logs directory {}: {}",
+                logs_dir.display(),
+                e
+            );
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "zed", disable_version_flag = true, max_term_width = 100)]
 struct Args {
@@ -1520,6 +1615,10 @@ struct Args {
     /// Output current environment variables as JSON to stdout
     #[arg(long, hide = true)]
     printenv: bool,
+
+    /// Output the latest crash log to stdout
+    #[arg(long)]
+    log: bool,
 }
 
 #[derive(Clone, Debug)]
