@@ -59,8 +59,7 @@ use settings::{Settings, update_settings_file};
 use theme::ThemeSettings;
 use ui::{
     Callout, ContextMenu, ContextMenuEntry, IconButtonShape, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProgressBar, Tab, TabBar, TabPosition, Tooltip, prelude::*,
-    utils::WithRemSize,
+    PopoverMenuHandle, Tab, TabBar, TabPosition, Tooltip, prelude::*, utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -332,6 +331,7 @@ impl ActiveView {
         }
     }
 
+    #[allow(dead_code)]
     fn native_agent(
         fs: Arc<dyn Fs>,
         prompt_store: Option<Entity<PromptStore>>,
@@ -361,6 +361,7 @@ impl ActiveView {
         Self::ExternalAgentThread { thread_view }
     }
 
+    #[allow(dead_code)]
     pub fn text_thread(
         text_thread_editor: Entity<TextThreadEditor>,
         language_registry: Arc<LanguageRegistry>,
@@ -464,7 +465,6 @@ pub struct AgentPanel {
     context_server_registry: Entity<ContextServerRegistry>,
     configuration: Option<Entity<AgentConfiguration>>,
     configuration_subscription: Option<Subscription>,
-    history_subscription: Option<Subscription>,
     threads: Vec<ThreadTab>,
     active_thread_index: usize,
     active_view: ActiveView,
@@ -1852,15 +1852,6 @@ impl AgentPanel {
             )
         });
 
-        let acp_history = self.acp_history.clone();
-        self.history_subscription = Some(cx.observe(&thread_view, move |_, thread_view, cx| {
-            if let Some(session_list) = thread_view.read(cx).session_list() {
-                acp_history.update(cx, |history, cx| {
-                    history.set_session_list(Some(session_list), cx);
-                });
-            }
-        }));
-
         let new_thread = ThreadTab::ExternalAgentThread { thread_view };
         self.threads.push(new_thread);
         self.active_thread_index = self.threads.len() - 1;
@@ -2306,7 +2297,7 @@ impl AgentPanel {
             })
     }
 
-    fn render_thread_tabs(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_thread_tabs(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.threads.is_empty() {
             return div().into_any();
         }
