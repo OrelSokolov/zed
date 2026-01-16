@@ -89,7 +89,7 @@ impl ThemeColors {
             toolbar_background: neutral().light().step_1(),
             tab_bar_background: neutral().light().step_2(),
             tab_inactive_background: neutral().light().step_2(),
-            tab_active_background: neutral().light().step_1(),
+            tab_active_background: gpui::white().opacity(0.5),
             search_match_background: neutral().light().step_5(),
             search_active_match_background: neutral().light().step_7(),
             panel_background: neutral().light().step_2(),
