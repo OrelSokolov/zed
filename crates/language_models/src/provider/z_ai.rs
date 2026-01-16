@@ -1,9 +1,8 @@
-use anyhow::{Result, Context as AnyhowContext};
+use anyhow::{Context as AnyhowContext, Result};
 use fs::Fs;
 use futures::{AsyncReadExt, FutureExt, StreamExt, future::BoxFuture};
 use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task, Window};
 use http_client::{AsyncBody, HttpClient, Method};
-use serde::Deserialize;
 use language_model::{
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
     LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
@@ -12,6 +11,7 @@ use language_model::{
     Role, env_var,
 };
 use open_ai::ResponseStreamEvent;
+use serde::Deserialize;
 pub use settings::ZaiAvailableModel as AvailableModel;
 use settings::{Settings, SettingsStore, update_settings_file};
 use std::sync::{Arc, LazyLock};
@@ -84,9 +84,10 @@ impl State {
 
     fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
         let api_url = ZAiLanguageModelProvider::api_url(cx);
-        let auth_task = self.api_key_state
-            .load_if_needed(api_url.clone(), |this| &mut this.api_key_state, cx);
-        
+        let auth_task =
+            self.api_key_state
+                .load_if_needed(api_url.clone(), |this| &mut this.api_key_state, cx);
+
         // Если аутентификация успешна, загружаем модели
         if self.api_key_state.has_key() {
             let fetch_task = self.fetch_models(cx);
@@ -96,27 +97,28 @@ impl State {
                 Ok(())
             });
         }
-        
+
         auth_task
     }
 
     fn fetch_models(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         let api_url = ZAiLanguageModelProvider::api_url(cx);
         let api_key = self.api_key_state.key(&api_url);
-        
+
         let http_client = self.http_client.clone();
         cx.spawn(async move |this, cx| {
             let Some(api_key) = api_key else {
                 anyhow::bail!("No API key available");
             };
-            
+
             log::debug!("[Z-AI] Fetching models from API: {}", api_url);
             let model_ids = ZAiLanguageModelProvider::fetch_models_from_api(
                 http_client.as_ref(),
                 &api_url,
                 &api_key,
-            ).await?;
-            
+            )
+            .await?;
+
             // Логируем детали каждой модели в момент получения
             for (idx, model_id) in model_ids.iter().enumerate() {
                 let max_tokens = get_model_max_tokens(model_id);
@@ -127,7 +129,7 @@ impl State {
                     max_tokens
                 );
             }
-            
+
             this.update(cx, |this, cx| {
                 this.available_models = model_ids;
                 cx.notify();
@@ -184,7 +186,7 @@ impl ZAiLanguageModelProvider {
     ) -> Result<Vec<String>> {
         let uri = format!("{}/models", api_url);
         log::debug!("[Z-AI] Fetching models from API: {}", uri);
-        
+
         let request = http_client::Request::builder()
             .method(Method::GET)
             .uri(uri)
@@ -200,14 +202,22 @@ impl ZAiLanguageModelProvider {
         let mut body = String::new();
         response.body_mut().read_to_string(&mut body).await?;
 
-        log::debug!("[Z-AI] API response status: {}, body: {}", response.status(), body);
+        log::debug!(
+            "[Z-AI] API response status: {}, body: {}",
+            response.status(),
+            body
+        );
 
         if response.status().is_success() {
-            let models_response: ModelsResponse = serde_json::from_str(&body)
-                .context("failed to parse models response")?;
-            
+            let models_response: ModelsResponse =
+                serde_json::from_str(&body).context("failed to parse models response")?;
+
             let model_ids: Vec<String> = models_response.data.into_iter().map(|m| m.id).collect();
-            log::info!("[Z-AI] Successfully fetched {} models from API: {:?}", model_ids.len(), model_ids);
+            log::info!(
+                "[Z-AI] Successfully fetched {} models from API: {:?}",
+                model_ids.len(),
+                model_ids
+            );
             Ok(model_ids)
         } else {
             anyhow::bail!(
@@ -263,7 +273,10 @@ impl CustomModel {
     fn from_available_model(model: &AvailableModel) -> Self {
         Self {
             id: model.name.clone(),
-            display_name: model.display_name.clone().unwrap_or_else(|| model.name.clone()),
+            display_name: model
+                .display_name
+                .clone()
+                .unwrap_or_else(|| model.name.clone()),
             max_tokens: model.max_tokens,
             max_output_tokens: model.max_output_tokens,
             supports_images: model.supports_images.unwrap_or(false),
@@ -677,7 +690,10 @@ impl ConfigurationView {
                             h_flex()
                                 .gap_2()
                                 .child(Icon::new(IconName::Check).color(Color::Success))
-                                .child(Label::new(format!("Using custom URL: {}", api_url)).size(LabelSize::Small)),
+                                .child(
+                                    Label::new(format!("Using custom URL: {}", api_url))
+                                        .size(LabelSize::Small),
+                                ),
                         )
                         .child(
                             Button::new("reset-api-url", "Reset")
@@ -686,9 +702,9 @@ impl ConfigurationView {
                                 .icon_size(IconSize::Small)
                                 .icon_position(IconPosition::Start)
                                 .layer(ElevationIndex::ModalSurface)
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.reset_api_url(window, cx)),
-                                ),
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.reset_api_url(window, cx)
+                                })),
                         ),
                 )
             })
@@ -761,4 +777,3 @@ impl Render for ConfigurationView {
         }
     }
 }
-

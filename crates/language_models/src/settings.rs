@@ -112,7 +112,9 @@ impl settings::Settings for AllLanguageModelSettings {
                 available_models: x_ai.available_models.unwrap_or_default(),
             },
             z_ai: ZAiSettings {
-                api_url: z_ai.api_url.unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string()),
+                api_url: z_ai
+                    .api_url
+                    .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string()),
                 available_models: z_ai.available_models.unwrap_or_default(),
             },
             zed_dot_dev: ZedDotDevSettings {

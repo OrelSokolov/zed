@@ -836,16 +836,11 @@ impl PathInclusionMatcher {
         // For example, `src/**/*.rs` becomes `src/` and `**/*.rs`. The glob part gets dropped.
         // Then, when checking whether a given directory should be scanned, we check whether it is a non-empty substring of any glob prefix.
         if query.filters_path() {
-            included.extend(
-                query
-                    .files_to_include()
-                    .sources()
-                    .filter_map(|glob| {
-                        let prefix = wax::Glob::new(glob).ok()?.partition().0;
-                        // Skip patterns with empty prefixes (e.g., **/*.rs) to avoid panics in wax
-                        (!prefix.as_os_str().is_empty()).then_some(prefix)
-                    }),
-            );
+            included.extend(query.files_to_include().sources().filter_map(|glob| {
+                let prefix = wax::Glob::new(glob).ok()?.partition().0;
+                // Skip patterns with empty prefixes (e.g., **/*.rs) to avoid panics in wax
+                (!prefix.as_os_str().is_empty()).then_some(prefix)
+            }));
         }
         Self { included, query }
     }
