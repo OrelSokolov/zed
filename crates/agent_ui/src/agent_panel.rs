@@ -232,7 +232,7 @@ enum ThreadTab {
 
 impl ThreadTab {
     fn title(&self, cx: &App) -> SharedString {
-        match self {
+        let title = match self {
             ThreadTab::ExternalAgentThread { thread_view } => {
                 let view = thread_view.read(cx);
                 // Пытаемся получить реальное название из AcpThread
@@ -246,7 +246,17 @@ impl ThreadTab {
             ThreadTab::TextThread {
                 text_thread_editor, ..
             } => text_thread_editor.read(cx).title(cx).to_string().into(),
-        }
+        };
+        let title = if title.len() > 20 {
+            let truncation_ix = title.char_indices().map(|(i, _)| i).nth(20);
+            match truncation_ix {
+                Some(index) => format!("{}...", &title[..index]),
+                None => title.to_string(),
+            }
+        } else {
+            title.to_string()
+        };
+        title.into()
     }
 }
 
