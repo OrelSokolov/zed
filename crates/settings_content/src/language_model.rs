@@ -350,6 +350,7 @@ pub struct ZaiAvailableModel {
     pub supports_images: Option<bool>,
     pub supports_tools: Option<bool>,
     pub parallel_tool_calls: Option<bool>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[with_fallible_options]

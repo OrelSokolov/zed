@@ -12,6 +12,7 @@ use language_model::{
 };
 use open_ai::ResponseStreamEvent;
 use serde::Deserialize;
+use settings::OpenAiReasoningEffort;
 pub use settings::ZaiAvailableModel as AvailableModel;
 use settings::{Settings, SettingsStore, update_settings_file};
 use std::sync::{Arc, LazyLock};
@@ -229,12 +230,14 @@ impl ZAiLanguageModelProvider {
     }
 
     fn create_language_model(&self, model: CustomModel) -> Arc<dyn LanguageModel> {
+        let reasoning_effort = model.reasoning_effort.clone();
         Arc::new(ZAiLanguageModel {
             id: LanguageModelId::from(model.id.clone()),
             model,
             state: self.state.clone(),
             http_client: self.http_client.clone(),
             request_limiter: RateLimiter::new(4),
+            reasoning_effort,
         })
     }
 
@@ -267,10 +270,22 @@ struct CustomModel {
     supports_images: bool,
     supports_tools: bool,
     parallel_tool_calls: bool,
+    reasoning_effort: Option<OpenAiReasoningEffort>,
 }
 
 impl CustomModel {
     fn from_available_model(model: &AvailableModel) -> Self {
+        let reasoning_effort =
+            model
+                .reasoning_effort
+                .as_ref()
+                .and_then(|effort| match effort.as_str() {
+                    "low" => Some(OpenAiReasoningEffort::Low),
+                    "medium" => Some(OpenAiReasoningEffort::Medium),
+                    "high" => Some(OpenAiReasoningEffort::High),
+                    _ => None,
+                });
+
         Self {
             id: model.name.clone(),
             display_name: model
@@ -282,6 +297,7 @@ impl CustomModel {
             supports_images: model.supports_images.unwrap_or(false),
             supports_tools: model.supports_tools.unwrap_or(true),
             parallel_tool_calls: model.parallel_tool_calls.unwrap_or(false),
+            reasoning_effort,
         }
     }
 }
@@ -341,6 +357,7 @@ impl LanguageModelProvider for ZAiLanguageModelProvider {
                     supports_images: false,
                     supports_tools: true,
                     parallel_tool_calls: false,
+                    reasoning_effort: Some(OpenAiReasoningEffort::Low),
                 };
                 models.push(self.create_language_model(custom_model));
             }
@@ -381,6 +398,7 @@ pub struct ZAiLanguageModel {
     state: Entity<State>,
     http_client: Arc<dyn HttpClient>,
     request_limiter: RateLimiter,
+    reasoning_effort: Option<open_ai::ReasoningEffort>,
 }
 
 impl ZAiLanguageModel {
@@ -419,6 +437,10 @@ impl ZAiLanguageModel {
         });
 
         async move { Ok(future.await?.boxed()) }.boxed()
+    }
+
+    fn reasoning_effort(&self) -> Option<open_ai::ReasoningEffort> {
+        self.reasoning_effort.clone()
     }
 }
 
@@ -505,13 +527,21 @@ impl LanguageModel for ZAiLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
+        let reasoning_effort = if request.thinking_allowed {
+            self.reasoning_effort
+                .clone()
+                .or_else(|| Some(open_ai::ReasoningEffort::Low))
+        } else {
+            None
+        };
+
         let request = crate::provider::open_ai::into_open_ai(
             request,
             &self.model.id,
             self.model.parallel_tool_calls,
             false,
             self.max_output_tokens(),
-            None,
+            reasoning_effort,
         );
         let completions = self.stream_completion(request, cx);
         async move {
